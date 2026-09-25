@@ -264,7 +264,6 @@ Item {
         activeProfile = Object.assign({}, profile, data.profile || {})
         showNotice("Connected to " + activeProfile.name, false)
         loadSchema()
-        loadDatabases()
       })
     }
     if (connectionId) {
@@ -275,7 +274,7 @@ Item {
     } else proceed()
   }
   function loadDatabases() {
-    if (!connectionId || !supportsDatabaseSwitch()) return
+    if (!databasePickerExpanded || !connectionId || !supportsDatabaseSwitch()) return
     var currentConnectionId = connectionId
     var generation = ++databaseLoadGeneration
     databasesLoading = true
@@ -324,7 +323,6 @@ Item {
       databaseNameInput.text = ""
       showNotice("Connected to " + activeProfile.database, false)
       loadSchema()
-      loadDatabases()
     })
   }
   function loadSchema() {
