@@ -41,6 +41,7 @@ Item {
     spacing: 0
 
     Rectangle {
+      id: tableFrame
       Layout.fillWidth: true
       Layout.fillHeight: true
       color: grid.surface
@@ -52,12 +53,35 @@ Item {
       Flickable {
         id: horizontal
         anchors.fill: parent
+        anchors.bottomMargin: horizontalBar.visible ? horizontalBar.height : 0
         visible: grid.columns.length > 0 && !grid.error
         contentWidth: grid.tableWidth
         contentHeight: height
         flickableDirection: Flickable.HorizontalFlick
         boundsBehavior: Flickable.StopAtBounds
         clip: true
+        ScrollBar.horizontal: ScrollBar {
+          id: horizontalBar
+          parent: tableFrame
+          width: tableFrame.width
+          y: tableFrame.height - height
+          height: 14
+          padding: 2
+          policy: ScrollBar.AlwaysOn
+          visible: horizontal.visible && horizontal.contentWidth > horizontal.width
+          active: true
+          background: Rectangle {
+            color: grid.surface
+            border.width: 1
+            border.color: grid.line
+          }
+          contentItem: Rectangle {
+            radius: height / 2
+            color: horizontalBar.pressed ? Qt.rgba(grid.ink.r, grid.ink.g, grid.ink.b, 0.8)
+              : horizontalBar.hovered ? Qt.rgba(grid.ink.r, grid.ink.g, grid.ink.b, 0.65)
+              : Qt.rgba(grid.ink.r, grid.ink.g, grid.ink.b, 0.45)
+          }
+        }
 
         Column {
           width: grid.tableWidth
