@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=DB Studio
+Comment=Browse databases and run SQL in Omarchy
+Exec=omarchy-shell shell summon andean-bridge.db-browser {}
+Icon=db-studio
+Categories=Development;Database;
+Terminal=false

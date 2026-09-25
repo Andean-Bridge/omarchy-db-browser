@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-label="DB Studio">
+  <rect x="5" y="5" width="118" height="118" rx="28" fill="#151827"/>
+  <rect x="6.5" y="6.5" width="115" height="115" rx="26.5" fill="none" stroke="#313550" stroke-width="3"/>
+  <path d="M31 36c0-10 15-17 33-17s33 7 33 17v56c0 10-15 17-33 17S31 102 31 92V36Z" fill="#242a40" stroke="#aaaafa" stroke-width="5" stroke-linejoin="round"/>
+  <ellipse cx="64" cy="36" rx="33" ry="17" fill="#353b62" stroke="#c4c4ff" stroke-width="5"/>
+  <path d="M31 58c0 10 15 17 33 17s33-7 33-17M31 80c0 10 15 17 33 17s33-7 33-17" fill="none" stroke="#aaaafa" stroke-width="5" stroke-linecap="round"/>
+  <circle cx="81" cy="91" r="6" fill="#6ee3bf"/>
+</svg>
