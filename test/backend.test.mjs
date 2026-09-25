@@ -8,6 +8,7 @@ import { normalizeProfile, parseConnectionString } from '../backend/connection-s
 import { ProfileStore } from '../backend/profiles.mjs';
 import { boundedNumber, cell, databaseName, identifier, openSwitchedDatabase, queryError, tableReadError } from '../backend/drivers.mjs';
 import { DEFAULT_RESULT_LIMIT, MAX_RESULT_LIMIT, resultLimit, SettingsStore } from '../backend/settings.mjs';
+import { createLineWriter } from '../backend/protocol.mjs';
 
 async function fixture() {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'db-browser-test-'));
@@ -356,6 +357,41 @@ test('default result limit persists privately and survives a new worker session'
     await assert.rejects(store.save({ defaultLimit: value }), /Limit must be between 1 and 1000/);
   }
   assert.deepEqual(await store.get(), { defaultLimit: 750 });
+});
+
+test('worker response lines survive short writes and stdout backpressure', async () => {
+  const chunks = [];
+  let attempts = 0;
+  let waits = 0;
+  const write = (fd, bytes, offset, length, position, callback) => {
+    assert.equal(fd, 91);
+    assert.equal(position, null);
+    attempts += 1;
+    if (attempts === 2 || attempts === 7) {
+      const error = Object.assign(new Error('pipe is full'), { code: 'EAGAIN' });
+      queueMicrotask(() => callback(error));
+      return;
+    }
+    if (attempts === 4) {
+      queueMicrotask(() => callback(null, 0));
+      return;
+    }
+    const count = Math.min(length, 4093);
+    chunks.push(Buffer.from(bytes.subarray(offset, offset + count)));
+    queueMicrotask(() => callback(null, count));
+  };
+  const writeLine = createLineWriter({ fd: 91, write, wait: async () => { waits += 1; } });
+  const responses = [
+    { id: 1, ok: true, data: { rows: [['π'.repeat(70000)]] } },
+    { id: 2, ok: true, data: { rows: [['next response']] } }
+  ];
+
+  await Promise.all(responses.map(response => writeLine(JSON.stringify(response))));
+  const output = Buffer.concat(chunks).toString('utf8');
+  assert.equal(output.endsWith('\n'), true);
+  assert.deepEqual(output.trimEnd().split('\n').map(JSON.parse), responses);
+  assert.equal(waits, 3);
+  assert.ok(attempts > 30);
 });
 
 test('worker uses JSON lines and keeps session-only credentials off stdout', async t => {

@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 import readline from 'node:readline';
-import { createReadStream, writeSync } from 'node:fs';
+import { createReadStream } from 'node:fs';
 import { ProfileStore } from './profiles.mjs';
 import { boundedNumber, databaseName, identifier, openDatabase, openSwitchedDatabase, tableReadError } from './drivers.mjs';
+import { createLineWriter } from './protocol.mjs';
 import { SettingsStore, resultLimit } from './settings.mjs';
 
 if (Number(process.versions.node.split('.')[0]) < 20) {
@@ -14,10 +15,19 @@ const profiles = new ProfileStore();
 const settings = new SettingsStore();
 const connections = new Map();
 const running = new Map();
+const writeLine = createLineWriter();
 
 function respond(id, ok, value) {
   const body = ok ? { id, ok: true, data: value } : { id, ok: false, error: value };
-  writeSync(1, JSON.stringify(body) + '\n');
+  let line;
+  try { line = JSON.stringify(body); }
+  catch { line = JSON.stringify({ id, ok: false, error: 'Operation failed. Check the connection and try again.' }); }
+  return writeLine(line);
+}
+
+function outputFailure() {
+  process.stderr.write('DB Studio could not write a worker response.\n');
+  process.exit(1);
 }
 
 function safeError(error) {
@@ -172,14 +182,17 @@ lines.on('line', line => {
       throw new Error('Invalid request.');
     }
   } catch {
-    respond(null, false, 'Invalid request.');
+    void respond(null, false, 'Invalid request.').catch(outputFailure);
     return;
   }
   const payload = request.payload && typeof request.payload === 'object' && !Array.isArray(request.payload)
     ? request.payload : {};
   handle(request.id, request.action, payload)
-    .then(result => respond(request.id, true, result))
-    .catch(error => respond(request.id, false, safeError(error)));
+    .then(
+      result => respond(request.id, true, result),
+      error => respond(request.id, false, safeError(error))
+    )
+    .catch(outputFailure);
 });
 
 async function shutdown() {

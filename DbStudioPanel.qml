@@ -131,8 +131,21 @@ Item {
   }
   function handleLine(line) {
     var response
-    try { response = JSON.parse(String(line || "").trim()) }
-    catch (_) { showNotice("Database worker returned an invalid response", true); return }
+    try {
+      response = JSON.parse(String(line || "").trim())
+      if (!response || typeof response !== "object" || typeof response.id !== "number") throw new Error("Invalid response")
+    }
+    catch (_) {
+      var error = "Database worker returned an invalid response. Retry the operation."
+      var waiting = pendingRequests
+      pendingRequests = ({})
+      queuedRequests = []
+      Object.keys(waiting).forEach(function(id) {
+        if (waiting[id].callback) waiting[id].callback(null, error)
+      })
+      showNotice(error, true)
+      return
+    }
     var entry = pendingRequests[response.id]
     if (!entry) return
     var next = Object.assign({}, pendingRequests)
