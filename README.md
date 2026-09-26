@@ -24,23 +24,21 @@ Choose a connection, explore its schemas, open a table or view, inspect its defi
 ## Requirements
 
 - Omarchy with the Quickshell plugin system.
-- Node.js 20 or newer and npm. The Omarchy plugin installer clones the repository but does not install Node dependencies.
+- Node.js 20 or newer and npm. The setup script installs npm and its Node.js dependency through Omarchy if needed.
 - A Secret Service compatible desktop keyring and `secret-tool` if you want to remember connections. Without a usable keyring, connections work for the current DB Studio session only.
 
 ## Install
 
-After this repository is published, install and enable it with:
+**Marketplace availability: Manual setup.** Omarchy installs the plugin source but does not run setup scripts. Run the second command below to install DB Studio's database drivers and launcher. The marketplace's **Snapshot verified** status covers the listed source commit; it does not remove this setup step.
+
+Run these two commands in a terminal:
 
 ```bash
 omarchy plugin add https://github.com/Andean-Bridge/omarchy-db-browser.git --enable
-cd ~/.config/omarchy/plugins/andean-bridge.db-browser
-npm ci --omit=dev --no-bin-links
-install -Dm644 assets/db-studio.svg ~/.local/share/icons/hicolor/scalable/apps/db-studio.svg
-install -Dm644 db-studio.desktop ~/.local/share/applications/db-studio.desktop
-omarchy-shell shell summon andean-bridge.db-browser '{}'
+bash "$HOME/.config/omarchy/plugins/andean-bridge.db-browser/setup.sh"
 ```
 
-Open DB Studio from its bar icon or the application launcher. The separate `npm ci` step is required because Omarchy installs the plugin source but not its Node dependencies. `--no-bin-links` avoids symlinks that the plugin validator rejects.
+The setup script installs npm and Node.js if needed, installs the locked database drivers with `npm ci --omit=dev --no-bin-links`, adds the app-launcher entry and icon, and opens DB Studio. Run it again after an update that changes the Node dependencies. `--no-bin-links` avoids symlinks that the plugin validator rejects.
 
 ## Remove
 
