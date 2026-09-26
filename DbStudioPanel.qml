@@ -43,6 +43,7 @@ Item {
   property string objectSearch: ""
   property var selectedObject: null
   property var inspectorDefinition: null
+  property int inspectorLoadGeneration: 0
 
   property var tabs: [{ id: "query-1", kind: "query", title: "Query 1", sql: "", columns: [], rows: [], durationMs: 0, rowCount: 0, hasMore: false, busy: false, error: "", message: "", pendingId: 0 }]
   property string activeTabId: "query-1"
@@ -153,7 +154,7 @@ Item {
     pendingRequests = next
     if (!response.ok) {
       var error = String(response.error || "Unknown database error")
-      showNotice(error, true)
+      if (entry.action !== "table.rows" && entry.action !== "table.describe" && !/cancel/i.test(error)) showNotice(error, true)
       if (entry.callback) entry.callback(null, error)
       return
     }
@@ -169,7 +170,11 @@ Item {
       profiles = data.profiles || []
       if (activeProfile) {
         var found = profiles.find(function(profile) { return profile.id === activeProfile.id })
-        if (found) activeProfile = Object.assign({}, activeProfile, found)
+        if (found) activeProfile = Object.assign({}, activeProfile, found, {
+          database: activeProfile.database,
+          transportSecure: activeProfile.transportSecure,
+          localConnection: activeProfile.localConnection
+        })
       }
     })
   }
@@ -201,6 +206,12 @@ Item {
   function clearDatabaseState() {
     schemaLoadGeneration++
     databaseLoadGeneration++
+    inspectorLoadGeneration++
+    if (workerReady && !stoppingWorker) {
+      tabs.forEach(function(tab) {
+        if (tab.kind === "table" && tab.pendingRowsId) request("query.cancel", { targetId: tab.pendingRowsId }, function() {})
+      })
+    }
     schemaLoading = false
     schemaError = ""
     databases = []
@@ -386,6 +397,19 @@ Item {
       return !needle || schema.name.toLowerCase().includes(needle) || filteredObjects(schema.name).length > 0
     })
   }
+  function visibleSchemaEntries() {
+    var entries = []
+    var visible = filteredSchemas()
+    for (var i = 0; i < visible.length; i++) {
+      var name = visible[i].name
+      entries.push({ kind: "schema", name: name, count: (objectsBySchema[name] || []).length })
+      if (schemaExpanded(name)) {
+        var children = filteredObjects(name)
+        for (var j = 0; j < children.length; j++) entries.push({ kind: "object", object: children[j] })
+      }
+    }
+    return entries
+  }
   function schemaExpanded(name) { return !!expandedSchemas[name] || objectSearch.trim() !== "" }
   function toggleSchema(name) {
     var next = Object.assign(Object.create(null), expandedSchemas)
@@ -412,6 +436,7 @@ Item {
   function closeTab(id) {
     var tab = tabs.find(function(entry) { return entry.id === id })
     if (tab && tab.pendingId) request("query.cancel", { targetId: tab.pendingId }, function() {})
+    if (tab && tab.pendingRowsId) request("query.cancel", { targetId: tab.pendingRowsId }, function() {})
     var currentIndex = tabs.findIndex(function(entry) { return entry.id === id })
     tabs = tabs.filter(function(entry) { return entry.id !== id })
     if (tabs.length === 0) { newQuery(); return }
@@ -429,6 +454,8 @@ Item {
     resultPane = "results"
     var requestId = request("query.run", { connectionId: queryConnectionId, sql: sql, limit: rowLimit, timeoutMs: timeoutMs }, function(data, error) {
       if (queryConnectionId !== connectionId) return
+      var currentTab = tabs.find(function(entry) { return entry.id === tabId })
+      if (!currentTab || currentTab.pendingId !== requestId) return
       if (error) {
         var cancelled = /cancel/i.test(error)
         updateTab(tabId, { busy: false, pendingId: 0, error: cancelled ? "" : error, message: cancelled ? "Query cancelled" : error })
@@ -467,7 +494,7 @@ Item {
     selectedObject = object
     var id = tableTabId(object)
     if (!tabs.some(function(tab) { return tab.id === id })) {
-      tabs = tabs.concat([{ id: id, kind: "table", title: object.name, object: object, tablePane: "data", columns: [], rows: [], hasMore: false, offset: 0, definition: null, busy: false, error: "" }])
+      tabs = tabs.concat([{ id: id, kind: "table", title: object.name, object: object, tablePane: "data", columns: [], rows: [], hasMore: false, offset: 0, definition: null, busy: false, pendingRowsId: 0, definitionRequestId: 0, error: "" }])
     }
     activeTabId = id
     inspectObject(object)
@@ -476,26 +503,42 @@ Item {
   function inspectObject(object) {
     if (!object || !connectionId) return
     var currentConnectionId = connectionId
+    var generation = ++inspectorLoadGeneration
     selectedObject = object
     inspectorDefinition = null
-    request("table.describe", { connectionId: currentConnectionId, schema: object.schema, name: object.name }, function(data, error) {
-      if (currentConnectionId !== connectionId) return
-      if (error) return
+    var tabId = tableTabId(object)
+    var requestId = request("table.describe", { connectionId: currentConnectionId, schema: object.schema, name: object.name }, function(data, error) {
+      if (currentConnectionId !== connectionId || generation !== inspectorLoadGeneration) return
+      if (!selectedObject || tableTabId(selectedObject) !== tabId) return
+      if (error) { showNotice(error, true); return }
       inspectorDefinition = data
-      var tabId = tableTabId(object)
-      updateTab(tabId, { definition: data })
+      var currentTab = tabs.find(function(tab) { return tab.id === tabId })
+      if (currentTab && currentTab.definitionRequestId === requestId) updateTab(tabId, { definition: data, definitionRequestId: 0 })
     })
+    if (tabs.some(function(tab) { return tab.id === tabId })) updateTab(tabId, { definitionRequestId: requestId })
   }
   function loadTableRows(tabId, offset) {
     var tab = tabs.find(function(entry) { return entry.id === tabId })
     if (!tab || !tab.object || !connectionId) return
     var currentConnectionId = connectionId
+    if (tab.pendingRowsId) request("query.cancel", { targetId: tab.pendingRowsId }, function() {})
     updateTab(tabId, { busy: true, error: "" })
-    request("table.rows", { connectionId: currentConnectionId, schema: tab.object.schema, name: tab.object.name, limit: rowLimit, offset: offset }, function(data, error) {
+    var requestId = request("table.rows", { connectionId: currentConnectionId, schema: tab.object.schema, name: tab.object.name, limit: rowLimit, offset: offset }, function(data, error) {
       if (currentConnectionId !== connectionId) return
-      if (error) { updateTab(tabId, { busy: false, error: error }); return }
-      updateTab(tabId, { busy: false, columns: data.columns || [], rows: data.rows || [], hasMore: !!data.hasMore, offset: data.offset || 0 })
+      var currentTab = tabs.find(function(entry) { return entry.id === tabId })
+      if (!currentTab || currentTab.pendingRowsId !== requestId) return
+      if (error) {
+        updateTab(tabId, { busy: false, pendingRowsId: 0, error: /cancel/i.test(error) ? "" : error })
+        if (/cancel/i.test(error)) showNotice("Table load cancelled", false)
+        return
+      }
+      updateTab(tabId, { busy: false, pendingRowsId: 0, columns: data.columns || [], rows: data.rows || [], hasMore: !!data.hasMore, offset: data.offset || 0 })
     })
+    updateTab(tabId, { pendingRowsId: requestId })
+  }
+  function cancelTableRows(tabId) {
+    var tab = tabs.find(function(entry) { return entry.id === tabId })
+    if (tab && tab.pendingRowsId) request("query.cancel", { targetId: tab.pendingRowsId }, function() {})
   }
   function prepareConnectionForm(profile) {
     var candidate = profile || {}
@@ -510,7 +553,7 @@ Item {
     passwordInput.text = ""
     connectionStringInput.text = ""
     rememberCheck.checked = profile ? !!profile.hasStoredConnection : true
-    sslCheck.checked = engineOptions[enginePicker.currentIndex].value !== "mysql"
+    sslCheck.checked = true
     formError.text = ""
   }
   function addConnection() {
@@ -895,12 +938,13 @@ Item {
                   ColumnLayout {
                     Layout.fillWidth: true
                     spacing: 2
-                    Text { Layout.fillWidth: true; text: root.activeProfile ? root.activeProfile.name : "No connection"; color: root.ink; font.family: root.uiFont; font.pixelSize: Math.max(15, Style.font.body); font.bold: true; elide: Text.ElideRight }
-                    Text { Layout.fillWidth: true; text: root.activeProfile ? root.engineName(root.activeProfile.type) : "Choose or add a database"; color: root.softInk; font.family: root.uiFont; font.pixelSize: Math.max(13, Style.font.bodySmall); elide: Text.ElideRight }
+                    Text { Layout.fillWidth: true; text: root.activeProfile ? root.activeProfile.name : "No connection"; textFormat: Text.PlainText; color: root.ink; font.family: root.uiFont; font.pixelSize: Math.max(15, Style.font.body); font.bold: true; elide: Text.ElideRight }
+                    Text { Layout.fillWidth: true; text: root.activeProfile ? root.engineName(root.activeProfile.type) + (root.activeProfile.transportSecure === true ? " · Verified TLS" : root.activeProfile.transportSecure === false ? " · No TLS" : "") : "Choose or add a database"; textFormat: Text.PlainText; color: root.softInk; font.family: root.uiFont; font.pixelSize: Math.max(13, Style.font.bodySmall); elide: Text.ElideRight }
                   }
                   StudioButton { label: "Choose"; compact: true; onClicked: connectionListDialog.open() }
                 }
               }
+              Text { Layout.fillWidth: true; visible: root.connectionId !== "" && !!root.activeProfile && root.activeProfile.transportSecure === false && !root.activeProfile.localConnection; text: "Unencrypted remote connection. Credentials and data may travel in plaintext."; textFormat: Text.PlainText; color: Color.urgent; font.family: root.uiFont; font.pixelSize: Math.max(12, Style.font.caption); wrapMode: Text.WordWrap }
               Rectangle {
                 Layout.fillWidth: true
                 Layout.preferredHeight: 54
@@ -948,39 +992,40 @@ Item {
                   StudioField { id: databaseSearchField; Layout.fillWidth: true; placeholderText: "Search databases…"; text: root.databaseSearch; onTextChanged: root.databaseSearch = text }
                   StudioButton { label: "Refresh"; compact: true; buttonEnabled: !root.databasesLoading && !root.databaseSwitching; onClicked: root.loadDatabases() }
                 }
-                ScrollView {
+                Item {
                   id: databaseScroll
                   Layout.fillWidth: true
                   Layout.fillHeight: true
                   clip: true
-                  ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
-                  Column {
-                    width: Math.max(0, databaseScroll.width - 12)
-                    Repeater {
-                      model: root.filteredDatabases()
-                      delegate: Rectangle {
-                        id: databaseRow
-                        required property var modelData
-                        readonly property bool isCurrent: !!root.activeProfile && String(root.activeProfile.database || "").toLowerCase() === modelData.name.toLowerCase()
-                        width: parent.width
-                        height: 34
-                        radius: 5
-                        color: isCurrent ? root.selected : databaseHover.hovered ? root.raised : "transparent"
-                        RowLayout {
-                          anchors.fill: parent
-                          anchors.leftMargin: 9
-                          anchors.rightMargin: 7
-                          spacing: 8
-                          StudioIcon { Layout.preferredWidth: 16; Layout.preferredHeight: 16; iconName: "server-database" }
-                          Text { Layout.fillWidth: true; text: databaseRow.modelData.name; textFormat: Text.PlainText; color: databaseRow.isCurrent ? root.ink : root.softInk; font.family: root.uiFont; font.pixelSize: Math.max(13, Style.font.bodySmall); font.bold: databaseRow.isCurrent; elide: Text.ElideRight }
-                          Text { visible: databaseRow.isCurrent; text: "Current"; color: root.accent; font.family: root.uiFont; font.pixelSize: Math.max(11, Style.font.caption) }
-                        }
-                        HoverHandler { id: databaseHover }
-                        MouseArea { anchors.fill: parent; cursorShape: databaseRow.isCurrent || root.databaseSwitching ? Qt.ArrowCursor : Qt.PointingHandCursor; onClicked: root.switchDatabase(databaseRow.modelData.name) }
+                  ListView {
+                    anchors.fill: parent
+                    anchors.rightMargin: 4
+                    clip: true
+                    model: root.filteredDatabases()
+                    boundsBehavior: Flickable.StopAtBounds
+                    ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+                    delegate: Rectangle {
+                      id: databaseRow
+                      required property var modelData
+                      readonly property bool isCurrent: !!root.activeProfile && String(root.activeProfile.database || "").toLowerCase() === modelData.name.toLowerCase()
+                      width: ListView.view.width
+                      height: 34
+                      radius: 5
+                      color: isCurrent ? root.selected : databaseHover.hovered ? root.raised : "transparent"
+                      RowLayout {
+                        anchors.fill: parent
+                        anchors.leftMargin: 9
+                        anchors.rightMargin: 7
+                        spacing: 8
+                        StudioIcon { Layout.preferredWidth: 16; Layout.preferredHeight: 16; iconName: "server-database" }
+                        Text { Layout.fillWidth: true; text: databaseRow.modelData.name; textFormat: Text.PlainText; color: databaseRow.isCurrent ? root.ink : root.softInk; font.family: root.uiFont; font.pixelSize: Math.max(13, Style.font.bodySmall); font.bold: databaseRow.isCurrent; elide: Text.ElideRight }
+                        Text { visible: databaseRow.isCurrent; text: "Current"; color: root.accent; font.family: root.uiFont; font.pixelSize: Math.max(11, Style.font.caption) }
                       }
+                      HoverHandler { id: databaseHover }
+                      MouseArea { anchors.fill: parent; cursorShape: databaseRow.isCurrent || root.databaseSwitching ? Qt.ArrowCursor : Qt.PointingHandCursor; onClicked: root.switchDatabase(databaseRow.modelData.name) }
                     }
-                    Text { width: parent.width; visible: !root.databasesLoading && root.filteredDatabases().length === 0; text: root.databaseSearch ? "No matching databases." : "No databases listed. Enter a name below."; color: root.softInk; font.family: root.uiFont; font.pixelSize: Math.max(13, Style.font.bodySmall); wrapMode: Text.WordWrap; topPadding: 10 }
                   }
+                  Text { anchors.top: parent.top; anchors.left: parent.left; anchors.right: parent.right; topPadding: 10; visible: !root.databasesLoading && root.filteredDatabases().length === 0; text: root.databaseSearch ? "No matching databases." : "No databases listed. Enter a name below."; color: root.softInk; font.family: root.uiFont; font.pixelSize: Math.max(13, Style.font.bodySmall); wrapMode: Text.WordWrap }
                 }
                 RowLayout {
                   Layout.fillWidth: true
@@ -1027,75 +1072,54 @@ Item {
                   StudioButton { label: "Retry"; compact: true; buttonEnabled: root.connectionId !== ""; onClicked: root.loadSchema() }
                 }
               }
-              ScrollView {
+              Item {
                 id: schemaScroll
                 Layout.fillWidth: true
                 Layout.fillHeight: true
                 visible: !root.databasePickerExpanded
                 clip: true
-                ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
-                Column {
-                  width: Math.max(0, schemaScroll.width - 12)
+                ListView {
+                  anchors.fill: parent
+                  anchors.rightMargin: 4
+                  clip: true
                   spacing: 2
-                  Repeater {
-                    model: root.filteredSchemas()
-                    delegate: Column {
-                      id: schemaRow
-                      required property var modelData
-                      width: parent.width
-                      spacing: 1
-                      Rectangle {
-                        width: parent.width
-                        height: 37
-                        color: schemaHover.hovered ? root.raised : "transparent"
-                        radius: 5
-                        RowLayout {
-                          anchors.fill: parent
-                          anchors.leftMargin: 7
-                          anchors.rightMargin: 8
-                          spacing: 9
-                          Text { text: root.schemaExpanded(schemaRow.modelData.name) ? "⌄" : "›"; color: root.softInk; font.pixelSize: 19; Layout.preferredWidth: 14 }
-                          StudioIcon { Layout.preferredWidth: 16; Layout.preferredHeight: 16; iconName: "server-database" }
-                          Text { Layout.fillWidth: true; text: schemaRow.modelData.name; textFormat: Text.PlainText; color: root.ink; font.family: root.uiFont; font.pixelSize: Math.max(14, Style.font.body); elide: Text.ElideRight }
-                          Text { text: String((root.objectsBySchema[schemaRow.modelData.name] || []).length); color: root.faintInk; font.pixelSize: Math.max(12, Style.font.caption) }
-                        }
-                        HoverHandler { id: schemaHover }
-                        MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: root.toggleSchema(schemaRow.modelData.name) }
-                      }
-                      Repeater {
-                        model: root.schemaExpanded(schemaRow.modelData.name) ? root.filteredObjects(schemaRow.modelData.name) : []
-                        delegate: Rectangle {
-                          id: objectRow
-                          required property var modelData
-                          width: schemaRow.width
-                          height: 35
-                          radius: 5
-                          color: objectHover.hovered ? root.raised : "transparent"
-                          RowLayout {
-                            anchors.fill: parent
-                            anchors.leftMargin: 39
-                            anchors.rightMargin: 8
-                            spacing: 9
-                            StudioIcon { Layout.preferredWidth: 16; Layout.preferredHeight: 16; iconName: objectRow.modelData.type === "view" ? "view-list-details" : "x-office-spreadsheet" }
-                            Text { Layout.fillWidth: true; text: objectRow.modelData.name; textFormat: Text.PlainText; color: root.ink; font.family: root.uiFont; font.pixelSize: Math.max(14, Style.font.body); elide: Text.ElideRight }
-                            Text { text: objectRow.modelData.type === "view" ? "view" : ""; color: root.faintInk; font.pixelSize: Math.max(12, Style.font.caption) }
-                          }
-                          HoverHandler { id: objectHover }
-                          MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: root.openTable(objectRow.modelData) }
-                        }
-                      }
+                  model: root.visibleSchemaEntries()
+                  boundsBehavior: Flickable.StopAtBounds
+                  ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+                  delegate: Rectangle {
+                    id: browserRow
+                    required property var modelData
+                    readonly property bool isSchema: modelData.kind === "schema"
+                    readonly property string schemaName: isSchema ? modelData.name : modelData.object.schema
+                    width: ListView.view.width
+                    height: isSchema ? 37 : 35
+                    color: rowHover.hovered ? root.raised : "transparent"
+                    radius: 5
+                    RowLayout {
+                      anchors.fill: parent
+                      anchors.leftMargin: browserRow.isSchema ? 7 : 39
+                      anchors.rightMargin: 8
+                      spacing: 9
+                      Text { visible: browserRow.isSchema; text: root.schemaExpanded(browserRow.schemaName) ? "⌄" : "›"; color: root.softInk; font.pixelSize: 19; Layout.preferredWidth: browserRow.isSchema ? 14 : 0 }
+                      StudioIcon { Layout.preferredWidth: 16; Layout.preferredHeight: 16; iconName: browserRow.isSchema ? "server-database" : browserRow.modelData.object.type === "view" ? "view-list-details" : "x-office-spreadsheet" }
+                      Text { Layout.fillWidth: true; text: browserRow.isSchema ? browserRow.schemaName : browserRow.modelData.object.name; textFormat: Text.PlainText; color: root.ink; font.family: root.uiFont; font.pixelSize: Math.max(14, Style.font.body); elide: Text.ElideRight }
+                      Text { text: browserRow.isSchema ? String(browserRow.modelData.count) : browserRow.modelData.object.type === "view" ? "view" : ""; color: root.faintInk; font.pixelSize: Math.max(12, Style.font.caption) }
                     }
+                    HoverHandler { id: rowHover }
+                    MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: browserRow.isSchema ? root.toggleSchema(browserRow.schemaName) : root.openTable(browserRow.modelData.object) }
                   }
-                  Text {
-                    width: parent.width
-                    visible: !root.connectionId || (!root.schemaLoading && !root.schemaError && root.filteredSchemas().length === 0)
-                    text: !root.connectionId ? "Connect to browse schemas and tables." : root.objectSearch ? "No matching objects." : "No tables or views found."
-                    color: root.softInk
-                    wrapMode: Text.WordWrap
-                    font.family: root.uiFont
-                    font.pixelSize: Math.max(14, Style.font.body)
-                    topPadding: 12
-                  }
+                }
+                Text {
+                  anchors.top: parent.top
+                  anchors.left: parent.left
+                  anchors.right: parent.right
+                  visible: !root.connectionId || (!root.schemaLoading && !root.schemaError && root.filteredSchemas().length === 0)
+                  text: !root.connectionId ? "Connect to browse schemas and tables." : root.objectSearch ? "No matching objects." : "No tables or views found."
+                  color: root.softInk
+                  wrapMode: Text.WordWrap
+                  font.family: root.uiFont
+                  font.pixelSize: Math.max(14, Style.font.body)
+                  topPadding: 12
                 }
               }
               StudioButton { Layout.fillWidth: true; label: "Add connection"; iconName: "list-add"; onClicked: root.addConnection() }
@@ -1143,7 +1167,7 @@ Item {
                         anchors.rightMargin: 7
                         spacing: 8
                         StudioIcon { Layout.preferredWidth: 16; Layout.preferredHeight: 16; iconName: workTab.modelData.kind === "query" ? "accessories-text-editor" : "x-office-spreadsheet" }
-                        Text { id: tabLabel; Layout.fillWidth: true; text: workTab.modelData.title; color: root.activeTabId === workTab.modelData.id ? root.ink : root.softInk; font.family: root.uiFont; font.pixelSize: Math.max(14, Style.font.body); elide: Text.ElideRight }
+                        Text { id: tabLabel; Layout.fillWidth: true; text: workTab.modelData.title; textFormat: Text.PlainText; color: root.activeTabId === workTab.modelData.id ? root.ink : root.softInk; font.family: root.uiFont; font.pixelSize: Math.max(14, Style.font.body); elide: Text.ElideRight }
                         StudioIcon { Layout.preferredWidth: 13; Layout.preferredHeight: 13; iconName: "window-close"; opacity: 0.65; MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: root.closeTab(workTab.modelData.id) } }
                       }
                     }
@@ -1184,20 +1208,23 @@ Item {
                     anchors.fill: parent
                     spacing: 0
                     Rectangle {
+                      id: editorGutter
                       Layout.preferredWidth: 50
                       Layout.fillHeight: true
                       color: root.surface
                       clip: true
+                      readonly property int lineHeight: Math.round(sqlEditor.font.pixelSize * 1.32)
+                      readonly property int firstVisibleLine: Math.min(Math.max(0, sqlEditor.lineCount - 1), Math.max(0, Math.floor(root.editorScrollY() / lineHeight)))
                       Column {
-                        y: 22 - root.editorScrollY()
+                        y: 22 - (root.editorScrollY() - editorGutter.firstVisibleLine * editorGutter.lineHeight)
                         width: parent.width
                         Repeater {
-                          model: Math.max(1, sqlEditor.lineCount)
+                          model: Math.max(0, Math.min(sqlEditor.lineCount - editorGutter.firstVisibleLine, Math.ceil(editorGutter.height / editorGutter.lineHeight) + 2))
                           delegate: Text {
                             required property int index
                             width: 50
-                            height: Math.round(sqlEditor.font.pixelSize * 1.32)
-                            text: String(index + 1)
+                            height: editorGutter.lineHeight
+                            text: String(editorGutter.firstVisibleLine + index + 1)
                             horizontalAlignment: Text.AlignHCenter
                             color: root.faintInk
                             font.family: root.codeFont
@@ -1214,7 +1241,17 @@ Item {
                       TextArea {
                         id: sqlEditor
                         text: ""
-                        onTextChanged: if (!root.syncingEditor && root.activeTab && root.activeTab.kind === "query" && text !== root.activeTab.sql) root.updateTab(root.activeTab.id, { sql: text })
+                        onTextChanged: {
+                          var limitedText = text.length > 200000 ? text.slice(0, 200000) : text
+                          if (lineCount > 10000) limitedText = limitedText.split("\n").slice(0, 10000).join("\n")
+                          var truncated = limitedText !== text
+                          if (truncated) {
+                            text = limitedText
+                            root.showNotice("SQL text is limited to 200,000 characters or 10,000 lines.", true)
+                          }
+                          if ((!root.syncingEditor || truncated) && root.activeTab && root.activeTab.kind === "query" && text !== root.activeTab.sql)
+                            root.updateTab(root.activeTab.id, { sql: text })
+                        }
                         placeholderText: "Write a SQL query…"
                         color: root.ink
                         placeholderTextColor: root.faintInk
@@ -1246,7 +1283,7 @@ Item {
                     Rectangle { Layout.preferredWidth: 1; Layout.preferredHeight: 28; color: root.line }
                     Text { text: root.activeTab && root.activeTab.busy ? "Running…" : "Ctrl+Enter to run"; color: root.softInk; font.family: root.uiFont; font.pixelSize: Math.max(12, Style.font.caption) }
                     Item { Layout.fillWidth: true }
-                    Text { text: root.activeProfile ? "Database: " + (root.activeProfile.database || root.activeProfile.name) : "No database selected"; color: root.softInk; font.family: root.uiFont; font.pixelSize: Math.max(13, Style.font.bodySmall); elide: Text.ElideRight }
+                    Text { text: root.activeProfile ? "Database: " + (root.activeProfile.database || root.activeProfile.name) : "No database selected"; textFormat: Text.PlainText; color: root.softInk; font.family: root.uiFont; font.pixelSize: Math.max(13, Style.font.bodySmall); elide: Text.ElideRight }
                   }
                 }
                   }
@@ -1368,7 +1405,8 @@ Item {
                   StudioTab { label: "Data"; iconName: "x-office-spreadsheet"; selectedTab: root.activeTab && root.activeTab.tablePane === "data"; onClicked: root.updateTab(root.activeTab.id, { tablePane: "data" }) }
                   StudioTab { label: "Definition"; iconName: "text-x-generic"; selectedTab: root.activeTab && root.activeTab.tablePane === "definition"; onClicked: root.updateTab(root.activeTab.id, { tablePane: "definition" }) }
                   Item { Layout.fillWidth: true }
-                  StudioButton { label: "Refresh"; compact: true; buttonEnabled: root.connectionId !== ""; onClicked: { if (root.activeTab) { root.inspectObject(root.activeTab.object); root.loadTableRows(root.activeTab.id, root.activeTab.offset || 0) } } Layout.rightMargin: 12 }
+                  StudioButton { label: "Cancel"; compact: true; visible: !!root.activeTab && root.activeTab.busy && root.activeTab.tablePane === "data"; onClicked: root.cancelTableRows(root.activeTab.id) }
+                  StudioButton { label: "Refresh"; compact: true; buttonEnabled: root.connectionId !== "" && !!root.activeTab && !root.activeTab.busy; onClicked: { if (root.activeTab) { root.inspectObject(root.activeTab.object); root.loadTableRows(root.activeTab.id, root.activeTab.offset || 0) } } Layout.rightMargin: 12 }
                 }
                 Rectangle { Layout.fillWidth: true; Layout.preferredHeight: 1; color: root.line }
                 DbGrid {
@@ -1511,7 +1549,7 @@ Item {
             implicitHeight: 40
             model: root.engineOptions
             textRole: "label"
-            onActivated: { portInput.text = root.engineOptions[currentIndex].port; sslCheck.checked = root.engineOptions[currentIndex].value !== "mysql" }
+            onActivated: { portInput.text = root.engineOptions[currentIndex].port; sslCheck.checked = true }
             contentItem: Text {
               text: enginePicker.displayText
               color: root.ink
@@ -1555,7 +1593,7 @@ Item {
               onClicked: {
                 enginePicker.currentIndex = index
                 portInput.text = root.engineOptions[index].port
-                sslCheck.checked = root.engineOptions[index].value !== "mysql"
+                sslCheck.checked = true
                 enginePicker.popup.close()
               }
             }
@@ -1609,8 +1647,25 @@ Item {
               }
             }
           }
-          StudioCheck { id: sslCheck; text: "Use TLS / SSL"; checked: true; enabled: root.engineOptions[enginePicker.currentIndex].value !== "azure_sql" }
-          Text { Layout.fillWidth: true; visible: root.engineOptions[enginePicker.currentIndex].value === "azure_sql"; text: "Azure SQL always uses verified TLS."; color: root.softInk; font.family: root.uiFont; font.pixelSize: Math.max(12, Style.font.caption); wrapMode: Text.WordWrap }
+          StudioCheck { id: sslCheck; text: "Use verified TLS"; checked: true; visible: connectionStringInput.text.trim() === ""; enabled: root.engineOptions[enginePicker.currentIndex].value !== "azure_sql" }
+          Text { Layout.fillWidth: true; visible: root.engineOptions[enginePicker.currentIndex].value === "azure_sql" && connectionStringInput.text.trim() === ""; text: "Azure SQL always uses verified TLS."; color: root.softInk; font.family: root.uiFont; font.pixelSize: Math.max(12, Style.font.caption); wrapMode: Text.WordWrap }
+          Text {
+            Layout.fillWidth: true
+            visible: connectionStringInput.text.trim() !== ""
+            text: root.engineOptions[enginePicker.currentIndex].value === "postgres"
+              ? "The URL controls TLS. Verified TLS is on unless sslmode=disable or ssl=false explicitly turns it off."
+              : root.engineOptions[enginePicker.currentIndex].value === "mysql"
+              ? "The string controls TLS. Remote hosts default to verified TLS; local MySQL may use plaintext. sslmode=disable or ssl=false turns it off."
+              : root.engineOptions[enginePicker.currentIndex].value === "sqlserver"
+              ? "The string controls TLS. Encrypt=false explicitly turns it off; credentials and data may then travel in plaintext."
+              : "Azure SQL always uses verified TLS, including with a connection string."
+            textFormat: Text.PlainText
+            color: root.softInk
+            font.family: root.uiFont
+            font.pixelSize: Math.max(12, Style.font.caption)
+            wrapMode: Text.WordWrap
+          }
+          Text { Layout.fillWidth: true; visible: connectionStringInput.text.trim() === "" && !sslCheck.checked; text: "TLS is off. Credentials and data may travel in plaintext."; textFormat: Text.PlainText; color: Color.urgent; font.family: root.uiFont; font.pixelSize: Math.max(12, Style.font.caption); wrapMode: Text.WordWrap }
           StudioCheck { id: rememberCheck; text: "Remember connection in system keyring"; checked: true }
           Text { Layout.fillWidth: true; text: "Without Remember, this connection works for this session and disappears when DB Studio closes."; color: root.softInk; font.family: root.uiFont; font.pixelSize: Math.max(12, Style.font.caption); wrapMode: Text.WordWrap }
           Text { id: formError; Layout.fillWidth: true; color: Color.urgent; font.family: root.uiFont; font.pixelSize: Math.max(13, Style.font.bodySmall); wrapMode: Text.WordWrap }
@@ -1668,7 +1723,7 @@ Item {
                   ColumnLayout {
                     Layout.fillWidth: true
                     spacing: 2
-                    Text { Layout.fillWidth: true; text: profileRow.modelData.name; color: root.ink; font.family: root.uiFont; font.pixelSize: Math.max(15, Style.font.body); font.bold: true; elide: Text.ElideRight }
+                    Text { Layout.fillWidth: true; text: profileRow.modelData.name; textFormat: Text.PlainText; color: root.ink; font.family: root.uiFont; font.pixelSize: Math.max(15, Style.font.body); font.bold: true; elide: Text.ElideRight }
                     Text { text: root.engineName(profileRow.modelData.type); color: root.softInk; font.family: root.uiFont; font.pixelSize: Math.max(12, Style.font.caption) }
                   }
                   StudioButton { label: "Connect"; compact: true; onClicked: { connectionListDialog.close(); root.openProfile(profileRow.modelData) } }

@@ -259,6 +259,52 @@ test('parser validates Azure TLS and separates credentials from metadata', () =>
   assert.equal(parseConnectionString('mysql://alice:secret@localhost/test').profile.type, 'mysql');
 });
 
+test('remote URL connections use verified TLS unless explicitly disabled', () => {
+  const pg = 'postgres://alice:secret@db.example.com/reports';
+  assert.equal(parseConnectionString(pg).profile.ssl, true);
+  assert.equal(parseConnectionString(`${pg}?sslmode=verify-full`).profile.ssl, true);
+  assert.equal(parseConnectionString(`${pg}?sslmode=disable`).profile.ssl, false);
+  assert.throws(() => parseConnectionString(`${pg}?sslmode=prefer`), /Unsupported PostgreSQL SSL mode/);
+  assert.throws(() => parseConnectionString(`${pg}?sslmode=disable&sslmode=require`), /Conflicting TLS/);
+
+  const mysql = 'mysql://alice:secret@db.example.com/reports';
+  assert.equal(parseConnectionString(mysql).profile.ssl, true);
+  assert.equal(parseConnectionString(`${mysql}?sslmode=disable`).profile.ssl, false);
+  assert.equal(parseConnectionString('mysql://root@localhost/devdb').profile.ssl, false);
+  assert.equal(parseConnectionString('mysql://root@127.0.0.2/devdb').profile.ssl, false);
+  assert.equal(parseConnectionString('mysql://root@127.999.999.999/devdb').profile.ssl, true);
+  assert.equal(parseConnectionString('Server=db.example.com;Database=reports;Uid=alice;Pwd=secret;', 'mysql').profile.ssl, true);
+  assert.equal(parseConnectionString('Server=db.example.com;Database=reports;Uid=alice;Pwd=secret;SslMode=None;', 'mysql').profile.ssl, false);
+  assert.throws(
+    () => parseConnectionString('Server=db.example.com;Database=reports;Uid=alice;Pwd=secret;SslMode=None;Ssl=True;', 'mysql'),
+    /Conflicting TLS/
+  );
+
+  assert.equal(normalizeProfile({ name: 'Remote PG', type: 'postgres', host: 'db.example.com', database: 'reports', user: 'alice' }).ssl, true);
+  assert.equal(normalizeProfile({ name: 'Remote MySQL', type: 'mysql', host: 'db.example.com', database: 'reports', user: 'alice' }).ssl, true);
+  assert.equal(normalizeProfile({ name: 'Plaintext opt-out', type: 'mysql', host: 'db.example.com', database: 'reports', user: 'alice', ssl: false }).ssl, false);
+});
+
+test('remembered remote form connection preserves its effective TLS choice', async t => {
+  const f = await fixture();
+  t.after(() => fs.rm(f.root, { recursive: true, force: true }));
+  const remote = await f.store.save({
+    profile: { name: 'Remote', type: 'postgres', host: 'db.example.com', database: 'reports', user: 'alice' },
+    password: 'secret', savePassword: true
+  });
+  assert.equal((await new ProfileStore({ filePath: f.filePath, keyring: f.keyring }).credentials(remote.profile.id)).profile.ssl, true);
+  assert.match(f.secrets.get(remote.profile.id), /"ssl":true/);
+
+  const plaintext = await f.store.save({
+    profile: { name: 'Explicit plaintext', type: 'mysql', host: 'db.example.com', database: 'reports', user: 'alice', ssl: false },
+    password: 'secret', savePassword: true
+  });
+  assert.equal((await f.store.credentials(plaintext.profile.id)).profile.ssl, false);
+  const metadata = await fs.readFile(f.filePath, 'utf8');
+  assert.equal(metadata.includes('db.example.com'), false);
+  assert.equal(metadata.includes('secret'), false);
+});
+
 test('bounded result parameters and diagnostics never echo a password or query text', () => {
   assert.equal(boundedNumber(100, 20, 1, 500, 'Limit'), 100);
   assert.throws(() => boundedNumber(501, 20, 1, 500, 'Limit'));

@@ -55,14 +55,10 @@ function appendRow(rows, raw, budget) {
   return true;
 }
 
-function sanitizeRows(rawRows) {
-  const rows = [];
-  const budget = { bytes: 0 };
-  let truncated = false;
-  for (const row of rawRows) {
-    if (!appendRow(rows, row, budget)) { truncated = true; break; }
-  }
-  return { rows, truncated };
+function oversizedRowError() {
+  const error = new Error('Could not load table data: A row exceeds the 5 MB display limit.');
+  error.code = 'ROW_TOO_LARGE';
+  return error;
 }
 
 function column(name, type) {
@@ -173,23 +169,57 @@ async function sqlserver(profile, password) {
         indexes: groupIndexes(indexes)
       };
     },
-    async rows(schema, name, limit, offset) {
+    rows(schema, name, limit, offset, onReady = () => {}) {
       const request = new mssql.Request(pool);
+      request.stream = true;
       request.arrayRowMode = true;
       request.input('offset', offset);
       request.input('count', limit + 1);
-      const timer = setTimeout(() => request.cancel(), 15000);
-      let result;
-      try {
-        result = await request.query(`SELECT * FROM ${sqlIdentifier(schema)}.${sqlIdentifier(name)} ORDER BY (SELECT NULL) OFFSET @offset ROWS FETCH NEXT @count ROWS ONLY`);
-      } finally { clearTimeout(timer); }
-      const data = result.recordset || [];
-      const output = sanitizeRows(data.slice(0, limit));
-      return {
-        columns: (result.columns?.[0] || []).map(meta => column(meta.name, meta.type?.name)),
-        rows: output.rows,
-        limit, offset, hasMore: data.length > limit || output.truncated
-      };
+      const rows = [];
+      const budget = { bytes: 0 };
+      let columns = [];
+      let hasMore = false;
+      let internalCancel = false;
+      let oversizedRow = false;
+      let userCancel = false;
+      let timedOut = false;
+      const cancel = () => { userCancel = true; try { request.cancel(); } catch {} };
+      onReady(cancel);
+      return new Promise((resolve, reject) => {
+        let settled = false;
+        let timer;
+        const stop = () => { try { request.cancel(); } catch {} };
+        const done = error => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          if (userCancel) reject(new Error('Query cancelled.'));
+          else if (timedOut) reject(new Error('Query timed out.'));
+          else if (oversizedRow) reject(oversizedRowError());
+          else if (error && !internalCancel) reject(error);
+          else resolve({ columns, rows, limit, offset, hasMore });
+        };
+        request.on('recordset', meta => {
+          if (!columns.length) columns = meta.map(item => column(item.name, item.type?.name));
+        });
+        request.on('row', row => {
+          if (internalCancel || userCancel || timedOut) return;
+          if (rows.length < limit) {
+            if (appendRow(rows, row, budget)) return;
+            if (rows.length === 0) oversizedRow = true;
+          }
+          hasMore = true;
+          internalCancel = true;
+          stop();
+        });
+        request.on('error', done);
+        request.on('done', () => done());
+        if (userCancel) { done(new Error('Query cancelled.')); return; }
+        timer = setTimeout(() => { timedOut = true; stop(); }, 15000);
+        try {
+          request.query(`SELECT * FROM ${sqlIdentifier(schema)}.${sqlIdentifier(name)} ORDER BY (SELECT NULL) OFFSET @offset ROWS FETCH NEXT @count ROWS ONLY`).catch(done);
+        } catch (error) { done(error); }
+      });
     },
     run(sql, limit, timeoutMs, onReady) {
       const request = new mssql.Request(pool);
@@ -264,7 +294,8 @@ async function postgres(profile, password) {
   const pool = new pg.Pool({
     host: profile.host, port: profile.port, database: profile.database,
     user: profile.user, password, ssl: profile.ssl ? { rejectUnauthorized: true } : false,
-    max: 4, connectionTimeoutMillis: 15000, idleTimeoutMillis: 30000
+    max: 4, connectionTimeoutMillis: 15000, idleTimeoutMillis: 30000,
+    statement_timeout: 15000
   });
   pool.on('error', () => {});
   const cancelPool = new pg.Pool({
@@ -278,7 +309,7 @@ async function postgres(profile, password) {
     await Promise.allSettled([pool.end(), cancelPool.end()]);
     throw new Error('Could not connect to PostgreSQL. Check the address, credentials, and TLS settings.');
   }
-  const metadata = async (text, params = []) => (await pool.query(text, params)).rows;
+  const metadata = async (text, params = []) => (await pool.query({ text, values: params, query_timeout: 20000 })).rows;
   return {
     type: profile.type,
     close: () => Promise.allSettled([pool.end(), cancelPool.end()]),
@@ -310,17 +341,72 @@ async function postgres(profile, password) {
         FROM pg_indexes WHERE schemaname=$1 AND tablename=$2 ORDER BY indexname`, [schema, name]);
       return { columns, indexes };
     },
-    async rows(schema, name, limit, offset) {
-      const result = await pool.query({
-        text: `SELECT * FROM ${pgIdentifier(schema)}.${pgIdentifier(name)} LIMIT $1 OFFSET $2`,
-        values: [limit + 1, offset], rowMode: 'array'
-      });
-      const output = sanitizeRows(result.rows.slice(0, limit));
-      return {
-        columns: result.fields.map(field => column(field.name, String(field.dataTypeID))),
-        rows: output.rows,
-        limit, offset, hasMore: result.rows.length > limit || output.truncated
+    async rows(schema, name, limit, offset, onReady = () => {}) {
+      const client = await pool.connect();
+      const rows = [];
+      const budget = { bytes: 0 };
+      let columns = [];
+      let hasMore = false;
+      let internalCancel = false;
+      let oversizedRow = false;
+      let userCancel = false;
+      let timedOut = false;
+      let started = false;
+      let cancelSent = false;
+      let hardStopTimer;
+      let reusable = false;
+      const cancel = () => {
+        if (cancelSent || !started) return;
+        cancelSent = true;
+        void cancelPool.query('SELECT pg_cancel_backend($1)', [client.processID])
+          .catch(() => client.connection?.stream?.destroy());
+        // A broken network can also stall the cancellation connection. Do not
+        // let a table read hold a pooled client indefinitely in that case.
+        hardStopTimer = setTimeout(() => client.connection?.stream?.destroy(), 1000);
       };
+      try {
+        onReady(() => { userCancel = true; cancel(); });
+        if (userCancel) throw new Error('Query cancelled.');
+        const query = new pg.Query({
+          text: `SELECT * FROM ${pgIdentifier(schema)}.${pgIdentifier(name)} LIMIT $1 OFFSET $2`,
+          values: [limit + 1, offset], rowMode: 'array'
+        });
+        const result = await new Promise((resolve, reject) => {
+          const timer = setTimeout(() => { timedOut = true; cancel(); }, 15000);
+          const finish = (callback, value) => { clearTimeout(timer); callback(value); };
+          query.on('row', (row, meta) => {
+            if (!columns.length && meta?.fields) columns = meta.fields.map(field => column(field.name, String(field.dataTypeID)));
+            if (internalCancel || userCancel || timedOut) return;
+            if (rows.length < limit) {
+              if (appendRow(rows, row, budget)) return;
+              if (rows.length === 0) oversizedRow = true;
+            }
+            hasMore = true;
+            internalCancel = true;
+            cancel();
+          });
+          query.on('error', error => finish(reject, error));
+          query.on('end', value => finish(resolve, value));
+          started = true;
+          try { client.query(query); }
+          catch (error) { finish(reject, error); }
+        });
+        if (!columns.length) columns = result.fields.map(field => column(field.name, String(field.dataTypeID)));
+        if (userCancel) throw new Error('Query cancelled.');
+        if (timedOut) throw new Error('Query timed out.');
+        if (oversizedRow) throw oversizedRowError();
+        reusable = !internalCancel;
+        return { columns, rows, limit, offset, hasMore };
+      } catch (error) {
+        if (userCancel) throw new Error('Query cancelled.');
+        if (timedOut) throw new Error('Query timed out.');
+        if (oversizedRow) throw oversizedRowError();
+        if (internalCancel) return { columns, rows, limit, offset, hasMore };
+        throw error;
+      } finally {
+        clearTimeout(hardStopTimer);
+        client.release(!reusable);
+      }
     },
     async run(sql, limit, timeoutMs, onReady) {
       const client = await pool.connect();
@@ -381,7 +467,7 @@ async function mysql(profile, password) {
   catch { throw new Error('MySQL driver is missing. Run npm ci --omit=dev.'); }
   const connectionConfig = {
     host: profile.host, port: profile.port, database: profile.database,
-    user: profile.user, password, ssl: profile.ssl ? { rejectUnauthorized: true } : undefined,
+    user: profile.user, password, ssl: profile.ssl ? { rejectUnauthorized: true, verifyIdentity: true } : undefined,
     connectTimeout: 15000, multipleStatements: false,
     supportBigNumbers: true, bigNumberStrings: true
   };
@@ -394,7 +480,9 @@ async function mysql(profile, password) {
     await Promise.allSettled([promisePool.end(), promiseCancelPool.end()]);
     throw new Error('Could not connect to MySQL. Check the address, credentials, and TLS settings.');
   }
-  const metadata = async (text, params = []) => (await promisePool.query(text, params))[0];
+  const metadata = async (text, params = []) => (await promisePool.query({
+    sql: text, values: params, timeout: 15000
+  }))[0];
   return {
     type: profile.type,
     close: () => Promise.allSettled([promisePool.end(), promiseCancelPool.end()]),
@@ -420,16 +508,62 @@ async function mysql(profile, password) {
         ORDER BY INDEX_NAME,SEQ_IN_INDEX`, [schema, name]);
       return { columns: columns.map(row => ({ ...row, nullable: Boolean(row.nullable), primaryKey: Boolean(row.primaryKey) })), indexes: groupIndexes(indexes) };
     },
-    async rows(schema, name, limit, offset) {
-      const [rows, fields] = await promisePool.query({
-        sql: `SELECT * FROM ${myIdentifier(schema)}.${myIdentifier(name)} LIMIT ? OFFSET ?`,
-        rowsAsArray: true, timeout: 15000
-      }, [limit + 1, offset]);
-      const output = sanitizeRows(rows.slice(0, limit));
-      return {
-        columns: fields.map(field => column(field.name, String(field.columnType))),
-        rows: output.rows, limit, offset, hasMore: rows.length > limit || output.truncated
-      };
+    rows(schema, name, limit, offset, onReady = () => {}) {
+      return new Promise((resolve, reject) => {
+        pool.getConnection((connectionError, connection) => {
+          if (connectionError) { reject(connectionError); return; }
+          const rows = [];
+          const budget = { bytes: 0 };
+          let columns = [];
+          let hasMore = false;
+          let internalCancel = false;
+          let oversizedRow = false;
+          let userCancel = false;
+          let queryStarted = false;
+          let settled = false;
+          let cancelSent = false;
+          let hardStopTimer;
+          const cancel = () => {
+            if (cancelSent) return;
+            cancelSent = true;
+            void promiseCancelPool.query(`KILL QUERY ${Number(connection.threadId)}`)
+              .catch(() => connection.destroy());
+            hardStopTimer = setTimeout(() => connection.destroy(), 1000);
+          };
+          const finish = error => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(hardStopTimer);
+            connection.destroy();
+            if (userCancel) reject(new Error('Query cancelled.'));
+            else if (oversizedRow) reject(oversizedRowError());
+            else if (error && !internalCancel) reject(error);
+            else resolve({ columns, rows, limit, offset, hasMore });
+          };
+          try {
+            onReady(() => { userCancel = true; if (queryStarted) cancel(); });
+            if (userCancel) { finish(new Error('Query cancelled.')); return; }
+            const query = connection.query({
+              sql: `SELECT * FROM ${myIdentifier(schema)}.${myIdentifier(name)} LIMIT ? OFFSET ?`,
+              values: [limit + 1, offset], rowsAsArray: true, timeout: 15000
+            });
+            queryStarted = true;
+            query.on('fields', fields => { columns = fields.map(field => column(field.name, String(field.columnType))); });
+            query.on('result', row => {
+              if (internalCancel || userCancel) return;
+              if (rows.length < limit) {
+                if (appendRow(rows, row, budget)) return;
+                if (rows.length === 0) oversizedRow = true;
+              }
+              hasMore = true;
+              internalCancel = true;
+              cancel();
+            });
+            query.on('error', finish);
+            query.on('end', () => finish());
+          } catch (error) { finish(error); }
+        });
+      });
     },
     run(sql, limit, timeoutMs, onReady) {
       return new Promise((resolve, reject) => {

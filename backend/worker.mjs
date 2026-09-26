@@ -2,6 +2,7 @@
 import readline from 'node:readline';
 import { createReadStream } from 'node:fs';
 import { ProfileStore } from './profiles.mjs';
+import { isLoopbackHost } from './connection-string.mjs';
 import { boundedNumber, databaseName, identifier, openDatabase, openSwitchedDatabase, tableReadError } from './drivers.mjs';
 import { createLineWriter } from './protocol.mjs';
 import { SettingsStore, resultLimit } from './settings.mjs';
@@ -43,9 +44,15 @@ function requireConnection(id) {
 }
 
 function publicConnection(connection) {
+  const { type, host, ssl, encrypt } = connection.profile;
   return {
     connectionId: connection.id,
-    profile: { ...connection.meta, database: connection.profile.database }
+    profile: {
+      ...connection.meta,
+      database: connection.profile.database,
+      transportSecure: type === 'postgres' || type === 'mysql' ? Boolean(ssl) : Boolean(encrypt),
+      localConnection: isLoopbackHost(host)
+    }
   };
 }
 
@@ -134,10 +141,24 @@ async function handle(id, action, payload) {
       const connection = requireConnection(payload.connectionId);
       const schema = schemaFor(connection, payload.schema);
       const name = identifier(payload.name, 'table name');
-      const limit = resultLimit(payload.limit, (await settings.get()).defaultLimit);
       const offset = boundedNumber(payload.offset, 0, 0, 10000000, 'Offset');
-      try { return await connection.adapter.rows(schema, name, limit, offset); }
-      catch (error) { throw tableReadError(error, connection.profile.type, 'data', connection.password); }
+      const task = { connectionId: connection.id, cancel: null, cancelRequested: false };
+      running.set(id, task);
+      try {
+        const limit = resultLimit(payload.limit, (await settings.get()).defaultLimit);
+        const result = await connection.adapter.rows(schema, name, limit, offset, cancel => {
+          task.cancel = cancel;
+          if (task.cancelRequested) cancel();
+        });
+        if (task.cancelRequested) throw new Error('Query cancelled.');
+        return result;
+      } catch (error) {
+        if (task.cancelRequested) throw new Error('Query cancelled.');
+        if (error?.code === 'ROW_TOO_LARGE') throw error;
+        throw tableReadError(error, connection.profile.type, 'data', connection.password);
+      } finally {
+        running.delete(id);
+      }
     }
     case 'query.run': {
       const connection = requireConnection(payload.connectionId);
@@ -161,7 +182,7 @@ async function handle(id, action, payload) {
     }
     case 'query.cancel': {
       const targetId = payload.targetId;
-      if (!Number.isSafeInteger(targetId)) throw new Error('Invalid query ID.');
+      if (!Number.isSafeInteger(targetId)) throw new Error('Invalid operation ID.');
       const task = running.get(targetId);
       if (!task) return { cancelled: false };
       task.cancelRequested = true;

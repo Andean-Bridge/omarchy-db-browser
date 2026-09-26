@@ -1,3 +1,5 @@
+import { isIP } from 'node:net';
+
 const TYPES = new Set(['azure_sql', 'sqlserver', 'postgres', 'mysql']);
 
 function booleanValue(value, fallback) {
@@ -20,6 +22,40 @@ function requiredText(value, label, maxLength = 255) {
     throw new Error(`${label} is required and must be a single line.`);
   }
   return value.trim();
+}
+
+export function isLoopbackHost(host) {
+  const value = String(host || '').toLowerCase().replace(/^\[|\]$/g, '').replace(/\.$/, '');
+  return value === 'localhost' || value === '::1' || (isIP(value) === 4 && value.startsWith('127.'));
+}
+
+function sslModeValue(value, type) {
+  if (value === undefined || value === null) return undefined;
+  const mode = String(value).trim().toLowerCase().replace(/[-_\s]/g, '');
+  if (['disable', 'disabled', 'none', 'false', '0'].includes(mode)) return false;
+  if (['require', 'required', 'verifyca', 'verifyfull', 'true', '1'].includes(mode)) return true;
+  throw new Error(`Unsupported ${type === 'postgres' ? 'PostgreSQL' : 'MySQL'} SSL mode.`);
+}
+
+function effectiveSsl(type, host, sslMode, sslFlag) {
+  const fromMode = sslModeValue(sslMode, type);
+  if (sslFlag !== undefined && sslFlag !== null && String(sslFlag).trim() === '') {
+    throw new Error('Invalid boolean connection option.');
+  }
+  const fromFlag = sslFlag === undefined || sslFlag === null ? undefined : booleanValue(sslFlag, undefined);
+  if (fromMode !== undefined && fromFlag !== undefined && fromMode !== fromFlag) {
+    throw new Error('Conflicting TLS connection options.');
+  }
+  // PostgreSQL URLs always use verified TLS unless they explicitly opt out.
+  // MySQL keeps passwordless local development usable, while remote hosts use
+  // verified TLS unless the connection string explicitly disables it.
+  return fromMode ?? fromFlag ?? (type === 'postgres' || !isLoopbackHost(host));
+}
+
+function urlOption(url, name) {
+  const matches = [...url.searchParams].filter(([key]) => key.toLowerCase() === name).map(([, value]) => value);
+  if (matches.length > 1) throw new Error('Conflicting TLS connection options.');
+  return matches[0];
 }
 
 export function normalizeType(type) {
@@ -100,26 +136,22 @@ function parseMysql(text) {
     const raw = item.slice(index + 1).trim();
     const value = raw.startsWith('{') && raw.endsWith('}')
       ? raw.slice(1, -1).replaceAll('}}', '}') : raw;
-    values.set(item.slice(0, index).trim().toLowerCase().replace(/[ _]/g, ''), value);
+    const key = item.slice(0, index).trim().toLowerCase().replace(/[ _]/g, '');
+    if ((key === 'sslmode' || key === 'ssl') && values.has(key)) {
+      throw new Error('Conflicting TLS connection options.');
+    }
+    values.set(key, value);
   }
   const get = (...keys) => keys.map(key => values.get(key)).find(value => value !== undefined);
-  const sslMode = get('sslmode');
-  let ssl;
-  if (sslMode !== undefined) {
-    if (/^(none|disabled|disable|false|0)$/i.test(sslMode)) ssl = false;
-    else if (/^(required|require|verifyca|verifyfull|true|1)$/i.test(sslMode)) ssl = true;
-    else throw new Error('Unsupported MySQL SSL mode.');
-  } else {
-    ssl = get('ssl');
-  }
+  const host = get('server', 'datasource', 'host') || '';
   return {
     profile: {
       type: 'mysql',
-      host: get('server', 'datasource', 'host') || '',
+      host,
       port: get('port'),
       database: get('database', 'initialcatalog') || '',
       user: get('userid', 'uid', 'user', 'username') || '',
-      ssl
+      ssl: effectiveSsl('mysql', host, get('sslmode'), get('ssl'))
     },
     password: get('password', 'pwd') ?? ''
   };
@@ -131,7 +163,8 @@ function parseUrl(text, requestedType) {
   const scheme = url.protocol.slice(0, -1);
   const type = scheme === 'postgresql' || scheme === 'postgres' ? 'postgres' : scheme === 'mysql' ? 'mysql' : null;
   if (!type || (requestedType && requestedType !== type)) throw new Error('The connection URL does not match the selected database type.');
-  const sslmode = url.searchParams.get('sslmode');
+  const sslmode = urlOption(url, 'sslmode');
+  const ssl = urlOption(url, 'ssl');
   return {
     profile: {
       type,
@@ -139,7 +172,7 @@ function parseUrl(text, requestedType) {
       port: url.port || undefined,
       database: decodeURIComponent(url.pathname.replace(/^\//, '')),
       user: decodeURIComponent(url.username),
-      ssl: sslmode ? !/^(disable|false)$/i.test(sslmode) : undefined
+      ssl: effectiveSsl(type, url.hostname, sslmode, ssl)
     },
     password: decodeURIComponent(url.password)
   };
@@ -157,14 +190,15 @@ export function parseConnectionString(text, requestedType) {
 export function normalizeProfile(input = {}) {
   if (!input || typeof input !== 'object' || Array.isArray(input)) throw new Error('Invalid connection profile.');
   const type = normalizeType(input.type);
+  const host = requiredText(input.host, 'Host');
   const profile = {
     name: requiredText(input.name, 'Connection name', 100),
     type,
-    host: requiredText(input.host, 'Host'),
+    host,
     port: optionalPort(input.port) || ({azure_sql: 1433, sqlserver: 1433, postgres: 5432, mysql: 3306})[type],
     database: requiredText(input.database, 'Database'),
     user: requiredText(input.user, 'User'),
-    ssl: type === 'postgres' || type === 'mysql' ? booleanValue(input.ssl, false) : undefined,
+    ssl: type === 'postgres' || type === 'mysql' ? booleanValue(input.ssl, !isLoopbackHost(host)) : undefined,
     encrypt: type === 'azure_sql' ? true : type === 'sqlserver' ? booleanValue(input.encrypt, true) : undefined,
     trustServerCertificate: type === 'azure_sql' ? false : type === 'sqlserver' ? booleanValue(input.trustServerCertificate, false) : undefined
   };
