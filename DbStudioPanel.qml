@@ -59,6 +59,17 @@ Item {
   property bool editingHasStoredConnection: false
   property string deleteProfileId: ""
 
+  property string aiTabId: ""
+  property string aiConnectionId: ""
+  property string aiOriginalSql: ""
+  property string aiLastError: ""
+  property string aiDraft: ""
+  property string aiExplanation: ""
+  property string aiError: ""
+  property bool aiBusy: false
+  property int aiRequestId: 0
+  property int aiGeneration: 0
+
   readonly property color bg: Color.popups.background
   readonly property color ink: Color.popups.text
   readonly property color softInk: Qt.rgba(ink.r, ink.g, ink.b, 0.62)
@@ -99,6 +110,7 @@ Item {
     else if (workerReady) refreshProfiles()
   }
   function close() {
+    aiDialog.close()
     closingFromHost = true
     window.visible = false
     stoppingWorker = true
@@ -474,6 +486,74 @@ Item {
       if (!error) updateTab(tab.id, { message: "Cancelling query…" })
     })
   }
+  function openAiDialog() {
+    var tab = activeTab
+    if (!tab || tab.kind !== "query") return
+    aiTabId = tab.id
+    aiConnectionId = connectionId
+    aiOriginalSql = String(tab.sql || "")
+    aiLastError = String(tab.error || "")
+    aiDraft = ""
+    aiExplanation = ""
+    aiError = ""
+    aiPromptField.text = aiLastError ? "Fix this query" : ""
+    aiDialog.open()
+    aiPromptField.forceActiveFocus()
+  }
+  function generateAiQuery() {
+    if (aiBusy || !aiPromptField.text.trim()) return
+    if (!aiConnectionId || aiConnectionId !== connectionId) {
+      aiError = "Connect to a database before asking AI to write SQL."
+      return
+    }
+    aiError = ""
+    aiDraft = ""
+    aiExplanation = ""
+    aiBusy = true
+    var generation = ++aiGeneration
+    var targetConnection = aiConnectionId
+    aiRequestId = request("ai.generate", {
+      connectionId: targetConnection,
+      instruction: aiPromptField.text.trim(),
+      sql: aiOriginalSql,
+      error: aiLastError,
+      selected: selectedObject ? { schema: selectedObject.schema, name: selectedObject.name } : null
+    }, function(data, error) {
+      if (generation !== aiGeneration) return
+      aiBusy = false
+      aiRequestId = 0
+      if (targetConnection !== connectionId) {
+        aiError = "The database connection changed. Open Ask AI again."
+        return
+      }
+      if (error) { aiError = error; return }
+      aiDraft = String(data.sql || "")
+      aiExplanation = String(data.explanation || "")
+      if (!aiDraft && !aiExplanation) aiError = "AI did not return a query. Try a more specific request."
+    })
+  }
+  function cancelAiQuery() {
+    ++aiGeneration
+    if (aiRequestId) request("ai.cancel", { targetId: aiRequestId }, function() {})
+    aiRequestId = 0
+    aiBusy = false
+  }
+  function useAiQuery() {
+    if (!aiDraft || aiConnectionId !== connectionId) {
+      aiError = "The database connection changed. Open Ask AI again."
+      return
+    }
+    var tab = tabs.find(function(entry) { return entry.id === aiTabId })
+    if (!tab || tab.kind !== "query") {
+      aiError = "The query tab is no longer open."
+      return
+    }
+    activeTabId = aiTabId
+    updateTab(aiTabId, { sql: aiDraft, error: "", message: "AI draft ready to review" })
+    syncEditor()
+    aiDialog.close()
+    sqlEditor.forceActiveFocus()
+  }
   function quoteName(name) {
     var type = activeProfile ? activeProfile.type : ""
     if (type === "postgres") return '"' + String(name).replace(/"/g, '""') + '"'
@@ -756,7 +836,7 @@ Item {
     color: !buttonEnabled ? root.surface : prominent ? root.accent : hovered.hovered ? root.raised : root.surface
     border.width: activeFocus ? 2 : prominent ? 0 : 1
     border.color: activeFocus ? root.accent : root.line
-    opacity: buttonEnabled ? 1 : 0.45
+    opacity: buttonEnabled ? 1 : 0.65
     Row {
       id: content
       anchors.centerIn: parent
@@ -764,7 +844,7 @@ Item {
       StudioIcon { width: 16; height: 16; iconName: button.iconName; visible: button.iconName !== "" }
       Text {
         text: button.label
-        color: button.prominent ? root.bg : root.ink
+        color: button.prominent && button.buttonEnabled ? root.bg : root.ink
         font.family: root.uiFont
         font.pixelSize: Math.max(14, Style.font.body)
         font.bold: button.prominent
@@ -1279,6 +1359,7 @@ Item {
                     anchors.rightMargin: 16
                     spacing: 12
                     StudioButton { label: "Run query"; iconName: "media-playback-start"; prominent: true; buttonEnabled: root.connectionId !== "" && root.activeTab && !root.activeTab.busy; onClicked: root.runQuery() }
+                    StudioButton { label: "✦ Ask AI"; compact: true; helpText: "Build or fix this query with AI"; Accessible.name: "Ask AI"; onClicked: root.openAiDialog() }
                     StudioButton { label: "Cancel"; iconName: "process-stop"; buttonEnabled: root.activeTab && root.activeTab.busy; onClicked: root.cancelQuery() }
                     Rectangle { Layout.preferredWidth: 1; Layout.preferredHeight: 28; color: root.line }
                     Text { text: root.activeTab && root.activeTab.busy ? "Running…" : "Ctrl+Enter to run"; color: root.softInk; font.family: root.uiFont; font.pixelSize: Math.max(12, Style.font.caption) }
@@ -1485,6 +1566,163 @@ Item {
           visible: root.notice !== ""
           color: root.noticeError ? Qt.rgba(Color.urgent.r, Color.urgent.g, Color.urgent.b, 0.13) : root.surface
           Text { anchors.fill: parent; anchors.leftMargin: 16; verticalAlignment: Text.AlignVCenter; text: root.notice; textFormat: Text.PlainText; color: root.noticeError ? Color.urgent : root.softInk; font.family: root.uiFont; font.pixelSize: Math.max(12, Style.font.caption); elide: Text.ElideRight }
+        }
+      }
+    }
+
+    Dialog {
+      id: aiDialog
+      parent: window.contentItem
+      modal: true
+      title: "Ask AI"
+      anchors.centerIn: parent
+      width: Math.min(680, window.width - 48)
+      height: Math.min(640, window.height - 48)
+      padding: 0
+      onClosed: root.cancelAiQuery()
+      Overlay.modal: Rectangle { color: Qt.rgba(0, 0, 0, 0.56) }
+      background: Rectangle {
+        color: Qt.tint(root.bg, Qt.rgba(root.ink.r, root.ink.g, root.ink.b, 0.10))
+        border.width: 2
+        border.color: Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.7)
+        radius: 10
+      }
+      header: Rectangle {
+        implicitHeight: 62
+        color: root.bg
+        radius: 10
+        Rectangle { anchors.left: parent.left; anchors.right: parent.right; anchors.bottom: parent.bottom; height: 1; color: Qt.rgba(root.ink.r, root.ink.g, root.ink.b, 0.25) }
+        RowLayout {
+          anchors.fill: parent
+          anchors.leftMargin: 20
+          anchors.rightMargin: 16
+          spacing: 10
+          Text { text: "✦"; color: root.accent; font.family: root.uiFont; font.pixelSize: 25 }
+          Text { Layout.fillWidth: true; text: "Ask AI"; color: root.ink; font.family: root.uiFont; font.pixelSize: Math.max(19, Style.font.heading); font.bold: true }
+          StudioButton { label: "Close"; compact: true; onClicked: aiDialog.close() }
+        }
+      }
+      contentItem: Item {
+        ColumnLayout {
+          anchors.fill: parent
+          spacing: 10
+          Text {
+            Layout.fillWidth: true
+            Layout.leftMargin: 20
+            Layout.rightMargin: 20
+            Layout.topMargin: 18
+            text: "YOUR REQUEST"
+            color: root.accent
+            font.family: root.uiFont
+            font.pixelSize: Math.max(12, Style.font.caption)
+            font.bold: true
+            font.letterSpacing: 1.1
+          }
+          Text {
+            Layout.fillWidth: true
+            Layout.leftMargin: 20
+            Layout.rightMargin: 20
+            text: "Describe the query you want, or ask AI to fix the SQL in this tab."
+            textFormat: Text.PlainText
+            color: root.ink
+            font.family: root.uiFont
+            font.pixelSize: Math.max(14, Style.font.body)
+            wrapMode: Text.WordWrap
+          }
+          ScrollView {
+            Layout.fillWidth: true
+            Layout.preferredHeight: 112
+            Layout.leftMargin: 20
+            Layout.rightMargin: 20
+            clip: true
+            TextArea {
+              id: aiPromptField
+              placeholderText: "E.g. Show the 20 newest orders with customer names…"
+              textFormat: TextEdit.PlainText
+              wrapMode: TextEdit.Wrap
+              selectByMouse: true
+              color: root.ink
+              placeholderTextColor: root.softInk
+              selectionColor: root.accent
+              selectedTextColor: root.bg
+              font.family: root.uiFont
+              font.pixelSize: Math.max(14, Style.font.body)
+              background: Rectangle { color: root.bg; border.width: aiPromptField.activeFocus ? 2 : 1; border.color: aiPromptField.activeFocus ? root.accent : Qt.rgba(root.ink.r, root.ink.g, root.ink.b, 0.35); radius: 6 }
+            }
+          }
+          Text {
+            Layout.fillWidth: true
+            Layout.leftMargin: 20
+            Layout.rightMargin: 20
+            text: root.connectionId === "" ? "Connect to a database to generate SQL with schema context."
+              : "Sends this tab's SQL" + (root.aiLastError ? ", its last error" : "") + ", and compact schema details to your Omarchy agent. The prompt excludes row data and connection credentials."
+            textFormat: Text.PlainText
+            color: root.softInk
+            font.family: root.uiFont
+            font.pixelSize: Math.max(12, Style.font.caption)
+            wrapMode: Text.WordWrap
+          }
+          Rectangle { Layout.fillWidth: true; Layout.preferredHeight: 1; color: Qt.rgba(root.ink.r, root.ink.g, root.ink.b, 0.25) }
+          RowLayout {
+            Layout.fillWidth: true
+            Layout.leftMargin: 20
+            Layout.rightMargin: 20
+            Text { Layout.fillWidth: true; text: "SUGGESTED SQL"; color: root.accent; font.family: root.uiFont; font.pixelSize: Math.max(12, Style.font.caption); font.bold: true; font.letterSpacing: 1.1 }
+            Text { text: root.aiBusy ? "Generating…" : "Review before running"; color: root.softInk; font.family: root.uiFont; font.pixelSize: Math.max(12, Style.font.caption) }
+          }
+          ScrollView {
+            Layout.fillWidth: true
+            Layout.fillHeight: true
+            Layout.minimumHeight: 90
+            Layout.leftMargin: 20
+            Layout.rightMargin: 20
+            Layout.bottomMargin: 10
+            clip: true
+            TextArea {
+              text: root.aiDraft
+              placeholderText: root.aiBusy ? "Choosing relevant tables and drafting SQL…" : "Your suggested query will appear here."
+              textFormat: TextEdit.PlainText
+              readOnly: true
+              selectByMouse: true
+              wrapMode: TextEdit.NoWrap
+              color: root.ink
+              placeholderTextColor: root.softInk
+              selectionColor: root.accent
+              selectedTextColor: root.bg
+              font.family: root.codeFont
+              font.pixelSize: Math.max(14, Style.font.body)
+              background: Rectangle { color: root.bg; border.width: 1; border.color: Qt.rgba(root.ink.r, root.ink.g, root.ink.b, 0.3); radius: 6 }
+            }
+          }
+          Text {
+            Layout.fillWidth: true
+            Layout.leftMargin: 20
+            Layout.rightMargin: 20
+            Layout.bottomMargin: 8
+            visible: root.aiExplanation !== "" || root.aiError !== ""
+            text: root.aiError || root.aiExplanation
+            textFormat: Text.PlainText
+            color: root.aiError ? Color.urgent : root.ink
+            font.family: root.uiFont
+            font.pixelSize: Math.max(13, Style.font.bodySmall)
+            wrapMode: Text.WordWrap
+          }
+        }
+      }
+      footer: Rectangle {
+        implicitHeight: 62
+        color: root.bg
+        radius: 10
+        Rectangle { anchors.left: parent.left; anchors.right: parent.right; anchors.top: parent.top; height: 1; color: Qt.rgba(root.ink.r, root.ink.g, root.ink.b, 0.25) }
+        RowLayout {
+          anchors.fill: parent
+          anchors.leftMargin: 20
+          anchors.rightMargin: 20
+          spacing: 10
+          Item { Layout.fillWidth: true }
+          StudioButton { label: root.aiBusy ? "Cancel request" : "Cancel"; compact: true; onClicked: aiDialog.close() }
+          StudioButton { label: "Generate"; compact: true; buttonEnabled: !root.aiBusy && root.connectionId !== "" && aiPromptField.text.trim() !== ""; onClicked: root.generateAiQuery() }
+          StudioButton { label: "Use in editor"; compact: true; prominent: true; buttonEnabled: root.aiDraft !== "" && !root.aiBusy; onClicked: root.useAiQuery() }
         }
       }
     }

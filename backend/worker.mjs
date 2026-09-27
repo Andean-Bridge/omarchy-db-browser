@@ -6,6 +6,7 @@ import { isLoopbackHost } from './connection-string.mjs';
 import { boundedNumber, databaseName, identifier, openDatabase, openSwitchedDatabase, tableReadError } from './drivers.mjs';
 import { createLineWriter } from './protocol.mjs';
 import { SettingsStore, resultLimit } from './settings.mjs';
+import { generateAiQuery } from './ai.mjs';
 
 if (Number(process.versions.node.split('.')[0]) < 20) {
   process.stderr.write('DB Studio requires Node.js 20 or newer.\n');
@@ -33,7 +34,7 @@ function outputFailure() {
 
 function safeError(error) {
   const message = typeof error?.message === 'string' ? error.message : '';
-  const safe = /^(Connection |Invalid |Select |Enter |Put |Port |Password |The connection |The database |The SQL Server |The old |Saved connection |Secure keyring |Could not |SQL Server driver |PostgreSQL driver |MySQL driver |Query failed|Query cancelled|Query timed out|Unsupported |Limit |Offset |Timeout |Settings |Connection name|Host |Database |User |The previously saved)/;
+  const safe = /^(AI |Connection |Invalid |Select |Enter |Put |Port |Password |The connection |The database |The SQL Server |The old |Saved connection |Secure keyring |Could not |SQL Server driver |PostgreSQL driver |MySQL driver |Query failed|Query cancelled|Query timed out|Unsupported |Limit |Offset |Timeout |Settings |Connection name|Host |Database |User |The previously saved)/;
   return safe.test(message) ? message : 'Operation failed. Check the connection and try again.';
 }
 
@@ -179,6 +180,38 @@ async function handle(id, action, payload) {
       } finally {
         running.delete(id);
       }
+    }
+    case 'ai.generate': {
+      const connection = requireConnection(payload.connectionId);
+      const controller = new AbortController();
+      const task = { kind: 'ai', connectionId: connection.id, cancelRequested: false,
+        cancel: () => controller.abort() };
+      running.set(id, task);
+      try {
+        const result = await generateAiQuery({
+          connection,
+          instruction: payload.instruction,
+          sql: payload.sql,
+          error: payload.error,
+          selected: payload.selected,
+          signal: controller.signal
+        });
+        if (task.cancelRequested || connections.get(connection.id) !== connection) {
+          throw new Error('AI request cancelled.');
+        }
+        return result;
+      } finally {
+        running.delete(id);
+      }
+    }
+    case 'ai.cancel': {
+      const targetId = payload.targetId;
+      if (!Number.isSafeInteger(targetId)) throw new Error('Invalid operation ID.');
+      const task = running.get(targetId);
+      if (!task || task.kind !== 'ai') return { cancelled: false };
+      task.cancelRequested = true;
+      task.cancel();
+      return { cancelled: true };
     }
     case 'query.cancel': {
       const targetId = payload.targetId;

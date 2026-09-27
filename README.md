@@ -11,6 +11,7 @@ Choose a connection, explore its schemas, open a table or view, inspect its defi
 - **Find what you need.** Search schemas, tables, and views from the sidebar. Empty schemas stay out of the way.
 - **Inspect data and structure.** Open a table or view to page through rows, or see its columns, keys, and indexes in **Definition**. The data grid is view-only in v1.
 - **Run SQL.** Work in multiple query tabs, use `Ctrl+Enter` to run a query, cancel a long-running query, and expand or resize the results area.
+- **Draft or fix SQL with AI.** Click **✦ Ask AI** beside **Run query**, describe the query you want or ask for a repair, and review the suggested SQL before choosing **Use in editor**. DB Studio uses the current tab's SQL and its last query error as context. It never runs the suggestion automatically.
 - **Keep results manageable.** Queries and table pages start at 100 rows. Set a default from 1 to 1,000 in **Settings**; DB Studio caps rows delivered for a query even when its `SELECT` has no `LIMIT` or `TOP`.
 - **Move between databases.** On SQL Server and Azure SQL, click the current database in the sidebar to open a full-height picker. Search the list or enter a database name directly, then choose one to return to the schema browser. MySQL shows accessible databases in the schema tree. For PostgreSQL, connect to a specific database and browse its schemas.
 
@@ -26,6 +27,13 @@ Choose a connection, explore its schemas, open a table or view, inspect its defi
 - Omarchy with the Quickshell plugin system.
 - Node.js 20 or newer and npm. The setup script installs npm and its Node.js dependency through Omarchy if needed.
 - A Secret Service compatible desktop keyring and `secret-tool` if you want to remember connections. Without a usable keyring, connections work for the current DB Studio session only.
+- For AI query drafting, an Omarchy default coding agent set to Codex with a signed-in Codex CLI. Other Omarchy agents are not supported by the in-panel AI action yet.
+
+## AI query context
+
+AI drafting sends your request, current SQL, last query error, database dialect, and relevant schema metadata to the selected Codex provider. DB Studio first sends a compact catalog of table and view names (up to 18,000 characters), then sends column names and types for at most eight relevant objects (up to 14,000 characters). The prompt excludes connection strings, passwords, row values, column defaults, and indexes. If the catalog is too large or the needed columns cannot be read, the assistant may ask for a more specific request rather than guessing.
+
+The AI action runs `codex exec` in noninteractive, ephemeral, read-only mode. Its draft replaces the open query tab only after you choose **Use in editor**; **Run query** remains a separate action.
 
 ## Install
 
