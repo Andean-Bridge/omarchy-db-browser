@@ -2,11 +2,12 @@
 import readline from 'node:readline';
 import { createReadStream } from 'node:fs';
 import { ProfileStore } from './profiles.mjs';
+import { CellValueStore } from './cell-values.mjs';
 import { isLoopbackHost } from './connection-string.mjs';
 import { boundedNumber, databaseName, identifier, openDatabase, openSwitchedDatabase, tableReadError } from './drivers.mjs';
 import { createLineWriter } from './protocol.mjs';
 import { SettingsStore, resultLimit } from './settings.mjs';
-import { generateAiQuery } from './ai.mjs';
+import { aiAvailability, generateAiQuery } from './ai.mjs';
 
 if (Number(process.versions.node.split('.')[0]) < 20) {
   process.stderr.write('DB Studio requires Node.js 20 or newer.\n');
@@ -17,6 +18,7 @@ const profiles = new ProfileStore();
 const settings = new SettingsStore();
 const connections = new Map();
 const running = new Map();
+const cellValues = new CellValueStore();
 const writeLine = createLineWriter();
 
 function respond(id, ok, value) {
@@ -34,7 +36,7 @@ function outputFailure() {
 
 function safeError(error) {
   const message = typeof error?.message === 'string' ? error.message : '';
-  const safe = /^(AI |Connection |Invalid |Select |Enter |Put |Port |Password |The connection |The database |The SQL Server |The old |Saved connection |Secure keyring |Could not |SQL Server driver |PostgreSQL driver |MySQL driver |Query failed|Query cancelled|Query timed out|Unsupported |Limit |Offset |Timeout |Settings |Connection name|Host |Database |User |The previously saved)/;
+  const safe = /^(AI |Cell value |Connection |Invalid |Select |Enter |Put |Port |Password |The connection |The database |The SQL Server |The old |Saved connection |Secure keyring |Could not |SQL Server driver |PostgreSQL driver |MySQL driver |Query failed|Query cancelled|Query timed out|Unsupported |Limit |Offset |Timeout |Settings |Connection name|Host |Database |User |The previously saved)/;
   return safe.test(message) ? message : 'Operation failed. Check the connection and try again.';
 }
 
@@ -75,13 +77,20 @@ function schemaFor(connection, schema) {
 async function handle(id, action, payload) {
   switch (action) {
     case 'settings.get': return settings.get();
+    case 'ai.status': return aiAvailability().catch(() => ({ available: false, agent: '' }));
     case 'settings.save': return settings.save(payload);
     case 'profiles.list': return { profiles: await profiles.list() };
     case 'profiles.save': return profiles.save(payload);
     case 'profiles.duplicate': return profiles.duplicate(payload.profileId);
     case 'profiles.delete': return profiles.delete(payload.profileId);
-    case 'connection.open': {
-      const { meta, profile, password } = await profiles.credentials(payload.profileId, payload);
+    case 'connection.open':
+    case 'agent.connection.open': {
+      const agentRequest = action === 'agent.connection.open';
+      if (agentRequest && (payload.password !== undefined || payload.connectionString !== undefined)) {
+        throw new Error('Invalid agent connection request.');
+      }
+      const { meta, profile, password } = await profiles.credentials(payload.profileId,
+        { ...payload, requireAgentAccess: agentRequest });
       const opened = await openDatabase({ ...profile, id: meta.id }, password);
       const connection = { ...opened, password, meta };
       connections.set(connection.id, connection);
@@ -91,6 +100,7 @@ async function handle(id, action, payload) {
       const connection = requireConnection(payload.connectionId);
       cancelConnectionTasks(connection.id);
       connections.delete(connection.id);
+      cellValues.clearConnection(connection.id);
       await connection.adapter.close();
       return { closed: true };
     }
@@ -117,6 +127,7 @@ async function handle(id, action, payload) {
       connections.set(replacement.id, replacement);
       connections.delete(previous.id);
       cancelConnectionTasks(previous.id);
+      cellValues.clearConnection(previous.id);
       await previous.adapter.close().catch(() => {});
       return publicConnection(replacement);
     }
@@ -144,20 +155,23 @@ async function handle(id, action, payload) {
       const name = identifier(payload.name, 'table name');
       const offset = boundedNumber(payload.offset, 0, 0, 10000000, 'Offset');
       const task = { connectionId: connection.id, cancel: null, cancelRequested: false };
+      const cellBatch = cellValues.begin(connection.id);
       running.set(id, task);
       try {
         const limit = resultLimit(payload.limit, (await settings.get()).defaultLimit);
         const result = await connection.adapter.rows(schema, name, limit, offset, cancel => {
           task.cancel = cancel;
           if (task.cancelRequested) cancel();
-        });
+        }, cellBatch);
         if (task.cancelRequested) throw new Error('Query cancelled.');
+        if (connections.get(connection.id) !== connection || !cellBatch.commit()) throw new Error('Connection is closed.');
         return result;
       } catch (error) {
         if (task.cancelRequested) throw new Error('Query cancelled.');
         if (error?.code === 'ROW_TOO_LARGE') throw error;
         throw tableReadError(error, connection.profile.type, 'data', connection.password);
       } finally {
+        cellBatch.discard();
         running.delete(id);
       }
     }
@@ -169,15 +183,19 @@ async function handle(id, action, payload) {
       const limit = resultLimit(payload.limit, (await settings.get()).defaultLimit);
       const timeoutMs = boundedNumber(payload.timeoutMs, 30000, 1000, 120000, 'Timeout');
       const task = { connectionId: connection.id, cancel: null, cancelRequested: false };
+      const cellBatch = cellValues.begin(connection.id);
       running.set(id, task);
       const start = Date.now();
       try {
         const result = await connection.adapter.run(payload.sql, limit, timeoutMs, cancel => {
           task.cancel = cancel;
           if (task.cancelRequested) cancel();
-        });
+        }, cellBatch);
+        if (task.cancelRequested) throw new Error('Query cancelled.');
+        if (connections.get(connection.id) !== connection || !cellBatch.commit()) throw new Error('Connection is closed.');
         return { ...result, durationMs: Date.now() - start };
       } finally {
+        cellBatch.discard();
         running.delete(id);
       }
     }
@@ -212,6 +230,12 @@ async function handle(id, action, payload) {
       task.cancelRequested = true;
       task.cancel();
       return { cancelled: true };
+    }
+    case 'cell.get': {
+      const connection = requireConnection(payload.connectionId);
+      const value = cellValues.get(connection.id, payload.handle);
+      if (!value) throw new Error('Cell value is no longer available. Refresh the results and try again.');
+      return value;
     }
     case 'query.cancel': {
       const targetId = payload.targetId;
@@ -251,6 +275,7 @@ lines.on('line', line => {
 
 async function shutdown() {
   for (const task of running.values()) task.cancel?.();
+  cellValues.dispose();
   await Promise.allSettled([...connections.values()].map(connection => connection.adapter.close()));
 }
 lines.on('close', () => { void shutdown(); });

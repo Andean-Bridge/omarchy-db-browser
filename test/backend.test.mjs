@@ -5,8 +5,9 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { normalizeProfile, parseConnectionString } from '../backend/connection-string.mjs';
+import { CellValueStore } from '../backend/cell-values.mjs';
 import { ProfileStore } from '../backend/profiles.mjs';
-import { boundedNumber, cell, databaseName, identifier, openSwitchedDatabase, queryError, tableReadError } from '../backend/drivers.mjs';
+import { appendRow, boundedNumber, cell, databaseName, identifier, openSwitchedDatabase, queryError, tableReadError } from '../backend/drivers.mjs';
 import { DEFAULT_RESULT_LIMIT, MAX_RESULT_LIMIT, resultLimit, SettingsStore } from '../backend/settings.mjs';
 import { createLineWriter } from '../backend/protocol.mjs';
 
@@ -32,7 +33,8 @@ test('remembered Azure connection is a single keyring secret; metadata contains 
   assert.equal(f.secrets.get(saved.profile.id), connectionString);
 
   const contents = await fs.readFile(f.filePath, 'utf8');
-  assert.deepEqual(Object.keys(JSON.parse(contents).profiles[0]).sort(), ['id', 'name', 'type']);
+  assert.deepEqual(Object.keys(JSON.parse(contents).profiles[0]).sort(), ['agentAccess', 'id', 'name', 'type']);
+  assert.equal(saved.profile.agentAccess, false);
   for (const sensitive of ['private.database.windows.net', 'payroll', 'analyst', 'SuperSecret123', 'Server=', 'Password=']) {
     assert.equal(contents.includes(sensitive), false, `${sensitive} leaked into metadata`);
   }
@@ -316,6 +318,90 @@ test('bounded result parameters and diagnostics never echo a password or query t
   assert.match(error.message, /Query failed/);
 });
 
+test('large text cells retain their full value only after an accepted result commits', t => {
+  const store = new CellValueStore();
+  t.after(() => store.dispose());
+  const batch = store.begin('connection-1');
+  const rows = [];
+  const refs = [];
+  const budget = { bytes: 0 };
+  const full = JSON.stringify({ message: 'é'.repeat(5000) });
+  assert.equal(appendRow(rows, ['short', full, 42], budget, refs, batch), true);
+  assert.equal(rows[0][0], 'short');
+  assert.equal(rows[0][1].length, 4097);
+  assert.equal(rows[0][2], 42);
+  assert.equal(refs.length, 1);
+  assert.deepEqual({ row: refs[0].row, column: refs[0].column, byteLength: refs[0].byteLength, complete: refs[0].complete },
+    { row: 0, column: 1, byteLength: Buffer.byteLength(full), complete: false });
+  assert.equal(store.get('connection-1', refs[0].handle), null, 'in-flight values must not be readable');
+  assert.equal(batch.commit(), true);
+  assert.deepEqual(store.get('connection-1', refs[0].handle), { text: full, byteLength: Buffer.byteLength(full) });
+  assert.equal(store.get('connection-2', refs[0].handle), null, 'handles are connection scoped');
+
+  const more = store.begin('connection-1');
+  const otherRows = [];
+  const otherRefs = [];
+  const document = { nested: { message: 'v'.repeat(5000) } };
+  assert.equal(appendRow(otherRows, [document, Buffer.alloc(5000)], { bytes: 0 }, otherRefs, more), true);
+  assert.equal(otherRefs.length, 2);
+  assert.equal(otherRefs[0].column, 0);
+  assert.equal(otherRefs[1].column, 1);
+  assert.equal(otherRefs[1].handle, null, 'binary previews do not become text handles');
+  more.commit();
+  assert.equal(store.get('connection-1', otherRefs[0].handle).text, JSON.stringify(document));
+
+  const rejected = store.begin('connection-1');
+  const rejectedRows = [];
+  const rejectedRefs = [];
+  const nearlyFull = { bytes: 5 * 1024 * 1024 - 50 };
+  const before = store.totalBytes;
+  assert.equal(appendRow(rejectedRows, [full], nearlyFull, rejectedRefs, rejected), false);
+  assert.deepEqual(rejectedRows, []);
+  assert.deepEqual(rejectedRefs, []);
+  assert.equal(store.totalBytes, before, 'a row outside the response budget must not be cached');
+  rejected.discard();
+
+  const cancelled = store.begin('connection-1');
+  const discardedHandle = cancelled.capture(full);
+  cancelled.discard();
+  assert.equal(store.get('connection-1', discardedHandle), null);
+});
+
+test('cell value cache enforces size, expiry, connection close, and zeroes evicted buffers', t => {
+  let now = 1000;
+  const store = new CellValueStore({ maxEntryBytes: 6000, maxTotalBytes: 10000, ttlMs: 100, now: () => now });
+  t.after(() => store.dispose());
+  const first = store.begin('A');
+  const firstHandle = first.capture('x'.repeat(5000));
+  const firstBuffer = store.entries.get(firstHandle).buffer;
+  first.commit();
+  const second = store.begin('A');
+  const secondHandle = second.capture('y'.repeat(5000));
+  second.commit();
+  const third = store.begin('A');
+  const thirdHandle = third.capture('z'.repeat(5000));
+  third.commit();
+  assert.equal(store.get('A', firstHandle), null, 'old completed values should be evicted');
+  assert.equal(firstBuffer.every(byte => byte === 0), true, 'evicted value buffer must be wiped');
+  assert.equal(store.get('A', secondHandle)?.byteLength, 5000);
+  assert.equal(store.get('A', thirdHandle)?.byteLength, 5000);
+  assert.equal(store.totalBytes, 10000);
+
+  const tooLarge = store.begin('A');
+  assert.equal(tooLarge.capture('w'.repeat(6001)), null);
+  tooLarge.discard();
+
+  now += 101;
+  assert.equal(store.get('A', thirdHandle), null, 'expired values must not be returned');
+  assert.equal(store.totalBytes, 0);
+
+  const closing = store.begin('A');
+  const closingHandle = closing.capture('closed'.repeat(1000));
+  store.clearConnection('A');
+  assert.equal(closing.commit(), false, 'a closed connection cannot commit pending values');
+  assert.equal(store.get('A', closingHandle), null);
+});
+
 test('PostgreSQL table errors identify missing schema USAGE or table SELECT without leaking details', () => {
   const schemaDenied = tableReadError(
     { code: '42501', message: 'permission denied for schema rnacen' },
@@ -393,16 +479,40 @@ test('default result limit persists privately and survives a new worker session'
   t.after(() => fs.rm(root, { recursive: true, force: true }));
   const filePath = path.join(root, 'omarchy', 'db-browser', 'settings.json');
   const store = new SettingsStore({ filePath });
-  assert.deepEqual(await store.get(), { defaultLimit: 100 });
-  assert.deepEqual(await store.save({ defaultLimit: 750 }), { defaultLimit: 750 });
-  assert.deepEqual(await new SettingsStore({ filePath }).get(), { defaultLimit: 750 });
+  assert.deepEqual(await store.get(), { defaultLimit: 100, reopenLastConnection: false, lastProfileId: null });
+  assert.deepEqual(await store.save({ defaultLimit: 750 }), { defaultLimit: 750, reopenLastConnection: false, lastProfileId: null });
+  assert.deepEqual(await new SettingsStore({ filePath }).get(), { defaultLimit: 750, reopenLastConnection: false, lastProfileId: null });
   assert.equal((await fs.stat(filePath)).mode & 0o777, 0o600);
   assert.equal((await fs.stat(path.dirname(filePath))).mode & 0o777, 0o700);
-  assert.deepEqual(JSON.parse(await fs.readFile(filePath, 'utf8')), { version: 1, defaultLimit: 750 });
+  assert.deepEqual(JSON.parse(await fs.readFile(filePath, 'utf8')), { version: 1, defaultLimit: 750, reopenLastConnection: false, lastProfileId: null });
   for (const value of [0, 1001, 1.5, undefined, '100', true, [100]]) {
     await assert.rejects(store.save({ defaultLimit: value }), /Limit must be between 1 and 1000/);
   }
-  assert.deepEqual(await store.get(), { defaultLimit: 750 });
+  assert.deepEqual(await store.get(), { defaultLimit: 750, reopenLastConnection: false, lastProfileId: null });
+});
+
+test('reconnect setting preserves old settings and records only a profile ID', async t => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'db-browser-reconnect-'));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const filePath = path.join(root, 'settings.json');
+  await fs.writeFile(filePath, JSON.stringify({ version: 1, defaultLimit: 250 }));
+  const store = new SettingsStore({ filePath });
+  assert.deepEqual(await store.get(), { defaultLimit: 250, reopenLastConnection: false, lastProfileId: null });
+
+  const id = '123e4567-e89b-42d3-a456-426614174000';
+  await store.save({ reopenLastConnection: true });
+  await store.save({ lastProfileId: id });
+  await store.save({ defaultLimit: 500 });
+  assert.deepEqual(await new SettingsStore({ filePath }).get(), {
+    defaultLimit: 500, reopenLastConnection: true, lastProfileId: id
+  });
+  assert.deepEqual(JSON.parse(await fs.readFile(filePath, 'utf8')), {
+    version: 1, defaultLimit: 500, reopenLastConnection: true, lastProfileId: id
+  });
+  await assert.rejects(store.save({ lastProfileId: 'server=private;password=secret' }), /Last connection ID is invalid/);
+  await assert.rejects(store.save({ reopenLastConnection: 'yes' }), /Reopen last connection must be true or false/);
+  await store.save({ lastProfileId: null });
+  assert.equal((await store.get()).lastProfileId, null);
 });
 
 test('worker response lines survive short writes and stdout backpressure', async () => {

@@ -1,11 +1,13 @@
 import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import { promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { PassThrough } from 'node:stream';
 import test from 'node:test';
-import { compactCatalog, compactDefinitions, generateAiQuery, omarchyDefaultAgent, runCodex } from '../backend/ai.mjs';
+import { aiAvailability, codexReady, compactCatalog, compactDefinitions, generateAiQuery, omarchyDefaultAgent, runCodex } from '../backend/ai.mjs';
+import { WorkerClient } from '../backend/worker-client.mjs';
 
 test('Omarchy agent selection is read without modifying its defaults', async t => {
   const home = await fs.mkdtemp(path.join(os.tmpdir(), 'db-studio-agent-'));
@@ -14,6 +16,61 @@ test('Omarchy agent selection is read without modifying its defaults', async t =
   await fs.mkdir(path.join(home, '.config/omarchy/defaults'), { recursive: true });
   await fs.writeFile(path.join(home, '.config/omarchy/defaults/agent'), 'codex\n');
   assert.equal(await omarchyDefaultAgent({ home }), 'codex');
+});
+
+test('AI availability requires Codex as the selected agent and a successful login status', async () => {
+  let checks = 0;
+  const checkCodex = async () => { checks++; return true; };
+  assert.deepEqual(await aiAvailability({ readAgent: async () => '', checkCodex }), { available: false, agent: '' });
+  assert.deepEqual(await aiAvailability({ readAgent: async () => 'claude', checkCodex }), { available: false, agent: 'claude' });
+  assert.equal(checks, 0);
+  assert.deepEqual(await aiAvailability({ readAgent: async () => 'codex', checkCodex }), { available: true, agent: 'codex' });
+  assert.equal(checks, 1);
+  assert.deepEqual(await aiAvailability({ readAgent: async () => 'codex', checkCodex: async () => false }),
+    { available: false, agent: 'codex' });
+  let invocation;
+  assert.equal(await codexReady({ environment: { PATH: '/usr/bin', HOME: '/tmp/fake-home', DB_PASSWORD: 'private' },
+    run: async (command, args, options) => { invocation = { command, args, options }; }
+  }), true);
+  assert.equal(invocation.command, 'codex');
+  assert.deepEqual(invocation.args, ['login', 'status']);
+  assert.equal(invocation.options.env.DB_PASSWORD, undefined);
+  assert.equal(await codexReady({ run: async () => { throw new Error('not installed'); } }), false);
+});
+
+test('worker AI status follows Omarchy selection and installed Codex login', async t => {
+  const home = await fs.mkdtemp(path.join(os.tmpdir(), 'db-studio-ai-status-'));
+  t.after(() => fs.rm(home, { recursive: true, force: true }));
+  const defaults = path.join(home, '.config/omarchy/defaults');
+  const fakeBin = path.join(home, 'bin');
+  await fs.mkdir(defaults, { recursive: true });
+  await fs.mkdir(fakeBin);
+  const codexPath = path.join(fakeBin, 'codex');
+  await fs.writeFile(codexPath, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+  const workerPath = new URL('../backend/worker.mjs', import.meta.url).pathname;
+  const client = new WorkerClient({ spawnWorker: () => spawn(process.execPath, [workerPath], {
+    env: { ...process.env, HOME: home, PATH: fakeBin }, stdio: ['pipe', 'pipe', 'pipe']
+  }) });
+  t.after(() => client.close());
+  assert.equal((await client.call('ai.status')).available, false);
+  await fs.writeFile(path.join(defaults, 'agent'), 'claude\n');
+  assert.equal((await client.call('ai.status')).available, false);
+  await fs.writeFile(path.join(defaults, 'agent'), 'codex\n');
+  assert.equal((await client.call('ai.status')).available, true);
+  await fs.writeFile(codexPath, '#!/bin/sh\nexit 1\n', { mode: 0o755 });
+  assert.equal((await client.call('ai.status')).available, false);
+  await fs.rm(codexPath);
+  assert.equal((await client.call('ai.status')).available, false);
+  assert.equal(Array.isArray((await client.call('profiles.list')).profiles), true);
+});
+
+test('AI generation stops before reading schema when Codex is unavailable', async () => {
+  let inspected = false;
+  await assert.rejects(generateAiQuery({
+    connection: { profile: { type: 'postgres' }, adapter: { async objects() { inspected = true; return []; } } },
+    instruction: 'Draft a query', readAgent: async () => 'codex', checkCodex: async () => false
+  }), /not installed or signed in/);
+  assert.equal(inspected, false);
 });
 
 test('AI uses a compact 500-object catalog and describes only selected tables', async () => {
@@ -47,6 +104,7 @@ test('AI uses a compact 500-object catalog and describes only selected tables', 
     sql: 'SELECT bad FROM sales.orders',
     error: 'Query failed: column bad does not exist',
     readAgent: async () => 'codex',
+    checkCodex: async () => true,
     runModel: async (prompt, schema) => {
       prompts.push({ prompt, schema });
       return schema === 'ai-tables.schema.json'

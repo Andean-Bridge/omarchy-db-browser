@@ -45,7 +45,7 @@ Item {
   property var inspectorDefinition: null
   property int inspectorLoadGeneration: 0
 
-  property var tabs: [{ id: "query-1", kind: "query", title: "Query 1", sql: "", columns: [], rows: [], durationMs: 0, rowCount: 0, hasMore: false, busy: false, error: "", message: "", pendingId: 0 }]
+  property var tabs: [{ id: "query-1", kind: "query", title: "Query 1", sql: "", columns: [], rows: [], cellRefs: [], durationMs: 0, rowCount: 0, hasMore: false, busy: false, error: "", message: "", pendingId: 0 }]
   property string activeTabId: "query-1"
   property int nextTabId: 2
   readonly property var activeTab: tabs.find(function(tab) { return tab.id === activeTabId }) || null
@@ -54,11 +54,26 @@ Item {
   property bool syncingEditor: false
   property int rowLimit: 100
   property int settingsVersion: 0
+  property bool reopenLastConnection: false
+  property string lastProfileId: ""
+  property bool profilesLoaded: false
+  property bool settingsLoaded: false
+  property bool automaticOpenAttempted: false
   property int timeoutMs: 30000
   property string editingProfileId: ""
   property bool editingHasStoredConnection: false
   property string deleteProfileId: ""
-
+  property var viewedCell: null
+  property var viewedSnapshot: null
+  property string viewerText: ""
+  property string viewerError: ""
+  property bool viewerLoading: false
+  property bool viewerComplete: false
+  property string viewerMode: "text"
+  property string viewerJsonText: ""
+  property int viewerGeneration: 0
+  property real viewerWidth: 900
+  property real viewerHeight: 630
   property string aiTabId: ""
   property string aiConnectionId: ""
   property string aiOriginalSql: ""
@@ -67,6 +82,8 @@ Item {
   property string aiExplanation: ""
   property string aiError: ""
   property bool aiBusy: false
+  property bool aiAvailable: false
+  property int aiStatusVersion: 0
   property int aiRequestId: 0
   property int aiGeneration: 0
 
@@ -107,7 +124,10 @@ Item {
     window.visible = true
     stoppingWorker = false
     if (!worker.running) worker.running = true
-    else if (workerReady) refreshProfiles()
+    else if (workerReady) {
+      refreshProfiles()
+      refreshAiAvailability()
+    }
   }
   function close() {
     aiDialog.close()
@@ -117,6 +137,8 @@ Item {
     connectionAttemptGeneration++
     worker.running = false
     workerReady = false
+    ++aiStatusVersion
+    aiAvailable = false
     connectionId = ""
     activeProfile = null
     clearDatabaseState()
@@ -166,7 +188,7 @@ Item {
     pendingRequests = next
     if (!response.ok) {
       var error = String(response.error || "Unknown database error")
-      if (entry.action !== "table.rows" && entry.action !== "table.describe" && !/cancel/i.test(error)) showNotice(error, true)
+      if (entry.action !== "table.rows" && entry.action !== "table.describe" && entry.action !== "cell.get" && !/cancel/i.test(error)) showNotice(error, true)
       if (entry.callback) entry.callback(null, error)
       return
     }
@@ -180,6 +202,7 @@ Item {
     request("profiles.list", {}, function(data, error) {
       if (error) return
       profiles = data.profiles || []
+      profilesLoaded = true
       if (activeProfile) {
         var found = profiles.find(function(profile) { return profile.id === activeProfile.id })
         if (found) activeProfile = Object.assign({}, activeProfile, found, {
@@ -188,6 +211,7 @@ Item {
           localConnection: activeProfile.localConnection
         })
       }
+      maybeReopenLastConnection()
     })
   }
   function loadSettings() {
@@ -196,6 +220,54 @@ Item {
       if (error || version !== settingsVersion) return
       var value = Number(data.defaultLimit)
       if (Number.isInteger(value) && value >= 1 && value <= 1000) rowLimit = value
+      reopenLastConnection = !!data.reopenLastConnection
+      lastProfileId = data.lastProfileId || ""
+      settingsLoaded = true
+      maybeReopenLastConnection()
+    })
+  }
+  function refreshAiAvailability() {
+    var version = ++aiStatusVersion
+    aiAvailable = false
+    request("ai.status", {}, function(data, error) {
+      if (version !== aiStatusVersion) return
+      aiAvailable = !error && data.available === true
+      if (!aiAvailable && aiDialog.visible && !aiError) aiDialog.close()
+    })
+  }
+  function maybeReopenLastConnection() {
+    if (automaticOpenAttempted || !workerReady || !settingsLoaded || !profilesLoaded ||
+        !reopenLastConnection || !lastProfileId || connectionId || connecting) return
+    automaticOpenAttempted = true
+    var profile = profiles.find(function(item) { return item.id === lastProfileId })
+    if (!profile || !profile.hasStoredConnection) {
+      showNotice("The last connection is no longer available. Choose a connection.", true)
+      return
+    }
+    openProfile(profile, undefined, true)
+  }
+  function rememberLastProfile(profile) {
+    var id = profile && profile.hasStoredConnection ? profile.id : null
+    lastProfileId = id || ""
+    request("settings.save", { lastProfileId: id }, function(_, error) {
+      if (error) showNotice("Could not remember the last connection.", true)
+    })
+  }
+  function setReopenLastConnection(enabled) {
+    var next = !!enabled
+    if (next === reopenLastConnection) return
+    var previous = reopenLastConnection
+    var version = ++settingsVersion
+    reopenLastConnection = next
+    request("settings.save", { reopenLastConnection: next }, function(data, error) {
+      if (version !== settingsVersion) return
+      if (error) {
+        reopenLastConnection = previous
+        reopenCheck.checked = previous
+        showNotice("Could not save the reconnect setting.", true)
+        return
+      }
+      reopenLastConnection = !!data.reopenLastConnection
     })
   }
   function setRowLimit(value) {
@@ -216,6 +288,7 @@ Item {
     })
   }
   function clearDatabaseState() {
+    closeCellViewer()
     schemaLoadGeneration++
     databaseLoadGeneration++
     inspectorLoadGeneration++
@@ -240,17 +313,19 @@ Item {
     selectedObject = null
     inspectorDefinition = null
     tabs = tabs.filter(function(tab) { return tab.kind === "query" }).map(function(tab) {
-      return Object.assign({}, tab, { columns: [], rows: [], rowCount: 0, hasMore: false, durationMs: 0, busy: false, error: "", message: "", pendingId: 0 })
+      return Object.assign({}, tab, { columns: [], rows: [], cellRefs: [], rowCount: 0, hasMore: false, durationMs: 0, busy: false, error: "", message: "", pendingId: 0 })
     })
     if (tabs.length === 0) {
       var id = "query-" + nextTabId++
-      tabs = [{ id: id, kind: "query", title: "Query " + (nextTabId - 1), sql: "", columns: [], rows: [], rowCount: 0, hasMore: false, durationMs: 0, busy: false, error: "", message: "", pendingId: 0 }]
+      tabs = [{ id: id, kind: "query", title: "Query " + (nextTabId - 1), sql: "", columns: [], rows: [], cellRefs: [], rowCount: 0, hasMore: false, durationMs: 0, busy: false, error: "", message: "", pendingId: 0 }]
     }
     if (!tabs.some(function(tab) { return tab.id === activeTabId })) activeTabId = tabs[0].id
     resultsExpanded = false
   }
   function disconnect() {
     connectionAttemptGeneration++
+    automaticOpenAttempted = true
+    if (lastProfileId) rememberLastProfile(null)
     if (!connectionId) return
     var oldId = connectionId
     connectionId = ""
@@ -259,8 +334,9 @@ Item {
     request("connection.close", { connectionId: oldId }, function() {})
     showNotice("Disconnected", false)
   }
-  function openProfile(profile, password) {
+  function openProfile(profile, password, automatic) {
     if (!profile) return
+    if (!automatic) automaticOpenAttempted = true
     var attempt = ++connectionAttemptGeneration
     var proceed = function() {
       if (attempt !== connectionAttemptGeneration) return
@@ -285,6 +361,7 @@ Item {
         }
         connectionId = data.connectionId || ""
         activeProfile = Object.assign({}, profile, data.profile || {})
+        rememberLastProfile(activeProfile)
         showNotice("Connected to " + activeProfile.name, false)
         loadSchema()
       })
@@ -431,6 +508,98 @@ Item {
   function updateTab(id, patch) {
     tabs = tabs.map(function(tab) { return tab.id === id ? Object.assign({}, tab, patch) : tab })
   }
+  function captureCell(cell) {
+    if (!cell || !activeTab || !connectionId) return null
+    return { connectionId: connectionId, tabId: activeTabId, rows: activeTab.rows, cell: cell }
+  }
+  function cellSnapshotCurrent(snapshot) {
+    if (!snapshot || snapshot.connectionId !== connectionId || snapshot.tabId !== activeTabId || !activeTab || activeTab.rows !== snapshot.rows) return false
+    var row = activeTab.rows[snapshot.cell.row]
+    var grid = activeTab.kind === "query" ? queryGrid : tableGrid
+    if (!row || snapshot.cell.column < 0 || snapshot.cell.column >= row.length || !grid
+        || grid.selectedRow !== snapshot.cell.row || grid.selectedColumn !== snapshot.cell.column) return false
+    var selected = grid.selectedCell()
+    return !!selected && selected.handle === snapshot.cell.handle && selected.preview === snapshot.cell.preview
+  }
+  function copyPlainText(value) {
+    clipboardBuffer.text = String(value)
+    clipboardBuffer.selectAll()
+    clipboardBuffer.copy()
+    clipboardBuffer.deselect()
+    clipboardBuffer.text = ""
+    showNotice("Copied to clipboard", false)
+  }
+  function copyCellValue(cell) {
+    var snapshot = captureCell(cell)
+    if (!snapshot) return
+    if (cell.complete) { copyPlainText(cell.preview); return }
+    if (!cell.handle) { showNotice("The full value is unavailable; the preview was not copied.", true); return }
+    request("cell.get", { connectionId: snapshot.connectionId, handle: cell.handle }, function(data, error) {
+      if (!cellSnapshotCurrent(snapshot)) return
+      if (error || !data || typeof data.text !== "string") {
+        showNotice("Could not copy the full value. Reload the results and try again.", true)
+        return
+      }
+      copyPlainText(data.text)
+    })
+  }
+  function closeCellViewer() {
+    viewerGeneration++
+    cellViewerDialog.close()
+  }
+  function openCellViewer(cell) {
+    var snapshot = captureCell(cell)
+    if (!snapshot) return
+    var generation = ++viewerGeneration
+    viewedCell = cell
+    viewedSnapshot = snapshot
+    viewerText = cell.preview
+    viewerError = ""
+    viewerLoading = !cell.complete && !!cell.handle
+    viewerComplete = !!cell.complete
+    viewerMode = "text"
+    viewerJsonText = ""
+    cellViewerDialog.open()
+    if (cell.complete) return
+    if (!cell.handle) {
+      viewerError = "Full value unavailable. This is only a preview."
+      return
+    }
+    request("cell.get", { connectionId: snapshot.connectionId, handle: cell.handle }, function(data, error) {
+      if (generation !== viewerGeneration || !cellViewerDialog.visible || !cellSnapshotCurrent(snapshot)) return
+      viewerLoading = false
+      if (error || !data || typeof data.text !== "string") {
+        viewerError = "Full value unavailable. Reload the results and try again."
+        return
+      }
+      viewerText = data.text
+      viewerComplete = true
+      viewedCell = Object.assign({}, cell, { byteLength: data.byteLength })
+    })
+  }
+  function setViewerMode(mode) {
+    if (mode === "json") {
+      if (!viewerComplete) return
+      if (!viewerJsonText) {
+        try { viewerJsonText = JSON.stringify(JSON.parse(viewerText), null, 2) }
+        catch (_) { viewerError = "This value is not valid JSON."; return }
+      }
+    }
+    if (viewerComplete) viewerError = ""
+    viewerMode = mode
+  }
+  function findInViewer() {
+    var needle = viewerSearch.text.toLocaleLowerCase()
+    if (!needle) return
+    var haystack = viewerTextArea.text.toLocaleLowerCase()
+    var start = Math.max(0, viewerTextArea.selectionEnd)
+    var match = haystack.indexOf(needle, start)
+    if (match < 0) match = haystack.indexOf(needle)
+    if (match < 0) { viewerError = "No match for “" + viewerSearch.text + "”."; return }
+    viewerError = ""
+    viewerTextArea.select(match, match + needle.length)
+    viewerTextArea.forceActiveFocus()
+  }
   function syncEditor() {
     if (!sqlEditor) return
     syncingEditor = true
@@ -438,10 +607,13 @@ Item {
     if (sqlEditor.text !== desired) sqlEditor.text = desired
     syncingEditor = false
   }
-  onActiveTabIdChanged: { resultsExpanded = false; syncEditor() }
+  onActiveTabIdChanged: { closeCellViewer(); resultsExpanded = false; syncEditor() }
+  onTabsChanged: {
+    if (cellViewerDialog.visible && !cellSnapshotCurrent(viewedSnapshot)) closeCellViewer()
+  }
   function newQuery(sql, title) {
     var id = "query-" + nextTabId++
-    tabs = tabs.concat([{ id: id, kind: "query", title: title || ("Query " + (nextTabId - 1)), sql: sql || "", columns: [], rows: [], durationMs: 0, rowCount: 0, hasMore: false, busy: false, error: "", message: "", pendingId: 0 }])
+    tabs = tabs.concat([{ id: id, kind: "query", title: title || ("Query " + (nextTabId - 1)), sql: sql || "", columns: [], rows: [], cellRefs: [], durationMs: 0, rowCount: 0, hasMore: false, busy: false, error: "", message: "", pendingId: 0 }])
     activeTabId = id
     resultPane = "results"
   }
@@ -462,7 +634,7 @@ Item {
     if (!sql) { showNotice("Write a query before running it", true); return }
     var tabId = tab.id
     var queryConnectionId = connectionId
-    updateTab(tabId, { busy: true, error: "", message: "Running query…", columns: [], rows: [] })
+    updateTab(tabId, { busy: true, error: "", message: "Running query…", columns: [], rows: [], cellRefs: [] })
     resultPane = "results"
     var requestId = request("query.run", { connectionId: queryConnectionId, sql: sql, limit: rowLimit, timeoutMs: timeoutMs }, function(data, error) {
       if (queryConnectionId !== connectionId) return
@@ -474,7 +646,7 @@ Item {
         if (cancelled) showNotice("Query cancelled", false)
         return
       }
-      updateTab(tabId, { busy: false, pendingId: 0, columns: data.columns || [], rows: data.rows || [], rowCount: data.rowCount || 0, hasMore: !!data.hasMore, durationMs: data.durationMs || 0, message: data.message || "Query completed" })
+      updateTab(tabId, { busy: false, pendingId: 0, columns: data.columns || [], rows: data.rows || [], cellRefs: data.cellRefs || [], rowCount: data.rowCount || 0, hasMore: !!data.hasMore, durationMs: data.durationMs || 0, message: data.message || "Query completed" })
       showNotice("Query completed", false)
     })
     updateTab(tabId, { pendingId: requestId })
@@ -487,6 +659,7 @@ Item {
     })
   }
   function openAiDialog() {
+    if (!aiAvailable) return
     var tab = activeTab
     if (!tab || tab.kind !== "query") return
     aiTabId = tab.id
@@ -501,7 +674,7 @@ Item {
     aiPromptField.forceActiveFocus()
   }
   function generateAiQuery() {
-    if (aiBusy || !aiPromptField.text.trim()) return
+    if (!aiAvailable || aiBusy || !aiPromptField.text.trim()) return
     if (!aiConnectionId || aiConnectionId !== connectionId) {
       aiError = "Connect to a database before asking AI to write SQL."
       return
@@ -526,7 +699,11 @@ Item {
         aiError = "The database connection changed. Open Ask AI again."
         return
       }
-      if (error) { aiError = error; return }
+      if (error) {
+        aiError = error
+        if (/not installed or signed in|not configured|not available yet/.test(error)) refreshAiAvailability()
+        return
+      }
       aiDraft = String(data.sql || "")
       aiExplanation = String(data.explanation || "")
       if (!aiDraft && !aiExplanation) aiError = "AI did not return a query. Try a more specific request."
@@ -574,7 +751,7 @@ Item {
     selectedObject = object
     var id = tableTabId(object)
     if (!tabs.some(function(tab) { return tab.id === id })) {
-      tabs = tabs.concat([{ id: id, kind: "table", title: object.name, object: object, tablePane: "data", columns: [], rows: [], hasMore: false, offset: 0, definition: null, busy: false, pendingRowsId: 0, definitionRequestId: 0, error: "" }])
+      tabs = tabs.concat([{ id: id, kind: "table", title: object.name, object: object, tablePane: "data", columns: [], rows: [], cellRefs: [], hasMore: false, offset: 0, pageOffsets: [0], definition: null, busy: false, pendingRowsId: 0, definitionRequestId: 0, error: "" }])
     }
     activeTabId = id
     inspectObject(object)
@@ -612,9 +789,29 @@ Item {
         if (/cancel/i.test(error)) showNotice("Table load cancelled", false)
         return
       }
-      updateTab(tabId, { busy: false, pendingRowsId: 0, columns: data.columns || [], rows: data.rows || [], hasMore: !!data.hasMore, offset: data.offset || 0 })
+      var pageOffset = Number.isInteger(data.offset) ? data.offset : offset
+      var pageOffsets = currentTab.pageOffsets || [0]
+      if (pageOffset === 0) pageOffsets = [0]
+      else {
+        var priorIndex = pageOffsets.indexOf(pageOffset)
+        if (priorIndex >= 0) pageOffsets = pageOffsets.slice(0, priorIndex + 1)
+        else if (pageOffset > currentTab.offset) pageOffsets = pageOffsets.concat([pageOffset])
+      }
+      updateTab(tabId, { busy: false, pendingRowsId: 0, columns: data.columns || [], rows: data.rows || [], cellRefs: data.cellRefs || [], hasMore: !!data.hasMore, offset: pageOffset, pageOffsets: pageOffsets })
     })
     updateTab(tabId, { pendingRowsId: requestId })
+  }
+  function nextTablePage(tabId) {
+    var tab = tabs.find(function(entry) { return entry.id === tabId })
+    if (!tab || !tab.hasMore || tab.rows.length === 0) return
+    loadTableRows(tabId, tab.offset + tab.rows.length)
+  }
+  function previousTablePage(tabId) {
+    var tab = tabs.find(function(entry) { return entry.id === tabId })
+    if (!tab) return
+    var offsets = tab.pageOffsets || [0]
+    var index = offsets.indexOf(tab.offset)
+    if (index > 0) loadTableRows(tabId, offsets[index - 1])
   }
   function cancelTableRows(tabId) {
     var tab = tabs.find(function(entry) { return entry.id === tabId })
@@ -633,6 +830,7 @@ Item {
     passwordInput.text = ""
     connectionStringInput.text = ""
     rememberCheck.checked = profile ? !!profile.hasStoredConnection : true
+    agentAccessCheck.checked = !!candidate.agentAccess
     sslCheck.checked = true
     formError.text = ""
   }
@@ -658,7 +856,8 @@ Item {
         database: databaseInput.text.trim(), user: userInput.text.trim(),
         ssl: sslCheck.checked, encrypt: type === "azure_sql" ? true : sslCheck.checked,
         trustServerCertificate: false },
-      savePassword: rememberCheck.checked
+      savePassword: rememberCheck.checked,
+      agentAccess: rememberCheck.checked && agentAccessCheck.checked
     }
     if (raw) payload.connectionString = raw
     if (secret) payload.password = secret
@@ -698,7 +897,11 @@ Item {
     if (!id) return
     if (activeProfile && activeProfile.id === id) disconnect()
     request("profiles.delete", { profileId: id }, function(_, error) {
-      if (!error) { refreshProfiles(); showNotice("Connection removed", false) }
+      if (!error) {
+        if (lastProfileId === id) rememberLastProfile(null)
+        refreshProfiles()
+        showNotice("Connection removed", false)
+      }
     })
   }
 
@@ -710,15 +913,21 @@ Item {
     stderr: SplitParser { onRead: data => { /* Never echo worker output; it may contain connection details. */ } }
     onStarted: {
       root.workerHasStarted = true
+      root.profilesLoaded = false
+      root.settingsLoaded = false
+      root.automaticOpenAttempted = false
       root.workerReady = true
       root.flushRequests()
       root.refreshProfiles()
       root.loadSettings()
+      root.refreshAiAvailability()
     }
     onRunningChanged: {
       if (!running && root.workerHasStarted) {
         root.workerHasStarted = false
         root.workerReady = false
+        ++root.aiStatusVersion
+        root.aiAvailable = false
         root.pendingRequests = ({})
         root.queuedRequests = []
         root.connectionId = ""
@@ -826,6 +1035,7 @@ Item {
     property bool prominent: false
     property bool compact: false
     property bool buttonEnabled: true
+    property string helpText: ""
     signal clicked()
     implicitWidth: content.implicitWidth + (compact ? 22 : 28)
     implicitHeight: compact ? 34 : 40
@@ -851,6 +1061,8 @@ Item {
       }
     }
     HoverHandler { id: hovered }
+    ToolTip.visible: hovered.hovered && button.helpText !== ""
+    ToolTip.text: button.helpText
     Keys.onReturnPressed: clicked()
     Keys.onSpacePressed: clicked()
     MouseArea { anchors.fill: parent; enabled: button.buttonEnabled; cursorShape: Qt.PointingHandCursor; onClicked: { button.forceActiveFocus(); button.clicked() } }
@@ -1359,7 +1571,7 @@ Item {
                     anchors.rightMargin: 16
                     spacing: 12
                     StudioButton { label: "Run query"; iconName: "media-playback-start"; prominent: true; buttonEnabled: root.connectionId !== "" && root.activeTab && !root.activeTab.busy; onClicked: root.runQuery() }
-                    StudioButton { label: "✦ Ask AI"; compact: true; helpText: "Build or fix this query with AI"; Accessible.name: "Ask AI"; onClicked: root.openAiDialog() }
+                    StudioButton { label: "✦ Ask AI"; compact: true; visible: root.aiAvailable; helpText: "Build or fix this query with AI"; Accessible.name: "Ask AI"; onClicked: root.openAiDialog() }
                     StudioButton { label: "Cancel"; iconName: "process-stop"; buttonEnabled: root.activeTab && root.activeTab.busy; onClicked: root.cancelQuery() }
                     Rectangle { Layout.preferredWidth: 1; Layout.preferredHeight: 28; color: root.line }
                     Text { text: root.activeTab && root.activeTab.busy ? "Running…" : "Ctrl+Enter to run"; color: root.softInk; font.family: root.uiFont; font.pixelSize: Math.max(12, Style.font.caption) }
@@ -1396,16 +1608,21 @@ Item {
                     }
                     Rectangle { Layout.fillWidth: true; Layout.preferredHeight: 1; color: root.line }
                     DbGrid {
+                      id: queryGrid
                       Layout.fillWidth: true
                       Layout.fillHeight: true
                       Layout.margins: 11
                       visible: root.resultPane === "results"
                       columns: root.activeTab ? root.activeTab.columns : []
                       rows: root.activeTab ? root.activeTab.rows : []
+                      cellRefs: root.activeTab ? root.activeTab.cellRefs || [] : []
                       busy: root.activeTab ? root.activeTab.busy : false
                       error: root.activeTab ? root.activeTab.error : ""
                       hasMore: root.activeTab ? root.activeTab.hasMore : false
                       emptyText: "The query returned no rows"
+                      onViewCell: function(cell) { root.openCellViewer(cell) }
+                      onCopyCell: function(cell) { root.copyCellValue(cell) }
+                      onCopyColumnName: function(name) { root.copyPlainText(name) }
                     }
                     Text {
                       Layout.fillWidth: true
@@ -1491,20 +1708,25 @@ Item {
                 }
                 Rectangle { Layout.fillWidth: true; Layout.preferredHeight: 1; color: root.line }
                 DbGrid {
+                  id: tableGrid
                   Layout.fillWidth: true
                   Layout.fillHeight: true
                   Layout.margins: 12
                   visible: root.activeTab && root.activeTab.tablePane === "data"
                   columns: root.activeTab ? root.activeTab.columns : []
                   rows: root.activeTab ? root.activeTab.rows : []
+                  cellRefs: root.activeTab ? root.activeTab.cellRefs || [] : []
                   busy: root.activeTab ? root.activeTab.busy : false
                   error: root.activeTab ? root.activeTab.error : ""
                   paged: true
                   offset: root.activeTab ? root.activeTab.offset || 0 : 0
                   hasMore: root.activeTab ? root.activeTab.hasMore : false
                   limit: root.rowLimit
-                  onNextPage: root.loadTableRows(root.activeTab.id, root.activeTab.offset + root.rowLimit)
-                  onPreviousPage: root.loadTableRows(root.activeTab.id, Math.max(0, root.activeTab.offset - root.rowLimit))
+                  onNextPage: root.nextTablePage(root.activeTab.id)
+                  onPreviousPage: root.previousTablePage(root.activeTab.id)
+                  onViewCell: function(cell) { root.openCellViewer(cell) }
+                  onCopyCell: function(cell) { root.copyCellValue(cell) }
+                  onCopyColumnName: function(name) { root.copyPlainText(name) }
                 }
                 ScrollView {
                   Layout.fillWidth: true
@@ -1568,6 +1790,16 @@ Item {
           Text { anchors.fill: parent; anchors.leftMargin: 16; verticalAlignment: Text.AlignVCenter; text: root.notice; textFormat: Text.PlainText; color: root.noticeError ? Color.urgent : root.softInk; font.family: root.uiFont; font.pixelSize: Math.max(12, Style.font.caption); elide: Text.ElideRight }
         }
       }
+    }
+
+    TextEdit {
+      id: clipboardBuffer
+      width: 1
+      height: 1
+      opacity: 0
+      textFormat: TextEdit.PlainText
+      readOnly: true
+      visible: true
     }
 
     Dialog {
@@ -1721,9 +1953,179 @@ Item {
           spacing: 10
           Item { Layout.fillWidth: true }
           StudioButton { label: root.aiBusy ? "Cancel request" : "Cancel"; compact: true; onClicked: aiDialog.close() }
-          StudioButton { label: "Generate"; compact: true; buttonEnabled: !root.aiBusy && root.connectionId !== "" && aiPromptField.text.trim() !== ""; onClicked: root.generateAiQuery() }
+          StudioButton { label: "Generate"; compact: true; buttonEnabled: root.aiAvailable && !root.aiBusy && root.connectionId !== "" && aiPromptField.text.trim() !== ""; onClicked: root.generateAiQuery() }
           StudioButton { label: "Use in editor"; compact: true; prominent: true; buttonEnabled: root.aiDraft !== "" && !root.aiBusy; onClicked: root.useAiQuery() }
         }
+      }
+    }
+
+    Dialog {
+      id: cellViewerDialog
+      parent: window.contentItem
+      modal: true
+      title: "Cell value"
+      anchors.centerIn: parent
+      width: Math.min(root.viewerWidth, window.width - 48)
+      height: Math.min(root.viewerHeight, window.height - 48)
+      padding: 0
+      background: Rectangle { color: root.bg; border.width: 1; border.color: root.line; radius: 9 }
+      header: Rectangle {
+        implicitHeight: 68
+        color: root.raised
+        radius: 9
+        RowLayout {
+          anchors.fill: parent
+          anchors.leftMargin: 20
+          anchors.rightMargin: 18
+          spacing: 12
+          ColumnLayout {
+            Layout.fillWidth: true
+            spacing: 2
+            Text {
+              Layout.fillWidth: true
+              text: root.viewedCell ? root.viewedCell.columnName : "Cell value"
+              textFormat: Text.PlainText
+              color: root.ink
+              font.family: root.uiFont
+              font.pixelSize: Math.max(18, Style.font.heading)
+              font.bold: true
+              elide: Text.ElideRight
+            }
+            Text {
+              text: root.viewedCell ? "Row " + root.viewedCell.displayRow + " · read only" : "Read only"
+              color: root.softInk
+              font.family: root.uiFont
+              font.pixelSize: Math.max(12, Style.font.caption)
+            }
+          }
+          StudioButton { label: "Close"; compact: true; onClicked: root.closeCellViewer() }
+        }
+      }
+      contentItem: Item {
+        ColumnLayout {
+        anchors.fill: parent
+        spacing: 0
+        RowLayout {
+          Layout.fillWidth: true
+          Layout.preferredHeight: 49
+          spacing: 0
+          StudioTab { label: "Text"; selectedTab: root.viewerMode === "text"; onClicked: root.setViewerMode("text") }
+          StudioTab { label: "JSON"; selectedTab: root.viewerMode === "json"; onClicked: root.setViewerMode("json") }
+          StudioTab { label: "HTML source"; selectedTab: root.viewerMode === "html"; onClicked: root.setViewerMode("html") }
+          Item { Layout.fillWidth: true }
+        }
+        Rectangle { Layout.fillWidth: true; Layout.preferredHeight: 1; color: root.line }
+        RowLayout {
+          Layout.fillWidth: true
+          Layout.preferredHeight: 55
+          Layout.leftMargin: 16
+          Layout.rightMargin: 16
+          spacing: 10
+          StudioField {
+            id: viewerSearch
+            Layout.fillWidth: true
+            placeholderText: "Find in value…"
+            onAccepted: root.findInViewer()
+          }
+          StudioButton { label: "Find next"; compact: true; onClicked: root.findInViewer() }
+          StudioCheck { id: viewerWrap; text: "Wrap"; checked: true }
+        }
+        Rectangle { Layout.fillWidth: true; Layout.preferredHeight: 1; color: root.line }
+        Text {
+          Layout.fillWidth: true
+          Layout.leftMargin: 18
+          Layout.rightMargin: 18
+          Layout.topMargin: 8
+          Layout.bottomMargin: 7
+          text: root.viewerLoading ? "Loading full value…"
+            : root.viewerError ? root.viewerError
+            : root.viewerComplete ? ((root.viewedCell && root.viewedCell.byteLength !== null ? root.viewedCell.byteLength + " bytes · " : "") + "Full value")
+            : "Preview only · full value unavailable"
+          textFormat: Text.PlainText
+          color: root.viewerError ? Color.urgent : root.softInk
+          font.family: root.uiFont
+          font.pixelSize: Math.max(12, Style.font.caption)
+          elide: Text.ElideRight
+        }
+        ScrollView {
+          Layout.fillWidth: true
+          Layout.fillHeight: true
+          Layout.leftMargin: 14
+          Layout.rightMargin: 14
+          Layout.bottomMargin: 8
+          clip: true
+          TextArea {
+            id: viewerTextArea
+            text: root.viewerMode === "json" ? root.viewerJsonText : root.viewerText
+            textFormat: TextEdit.PlainText
+            readOnly: true
+            selectByMouse: true
+            wrapMode: viewerWrap.checked && root.viewerMode !== "html" ? TextEdit.WrapAnywhere : TextEdit.NoWrap
+            color: root.ink
+            selectionColor: root.accent
+            selectedTextColor: root.bg
+            font.family: root.codeFont
+            font.pixelSize: Math.max(14, Style.font.body)
+            background: Rectangle { color: root.surface; border.width: 1; border.color: root.line; radius: 5 }
+          }
+        }
+        Rectangle { Layout.fillWidth: true; Layout.preferredHeight: 1; color: root.line }
+        RowLayout {
+          Layout.fillWidth: true
+          Layout.preferredHeight: 52
+          Layout.leftMargin: 16
+          Layout.rightMargin: 16
+          spacing: 10
+          Text {
+            Layout.fillWidth: true
+            text: root.viewerMode === "html" ? "HTML is shown as source." : ""
+            color: root.softInk
+            font.family: root.uiFont
+            font.pixelSize: Math.max(12, Style.font.caption)
+          }
+          StudioButton { label: "Copy original value"; compact: true; buttonEnabled: root.viewerComplete; onClicked: root.copyPlainText(root.viewerText) }
+          StudioButton { label: "Close"; compact: true; onClicked: root.closeCellViewer() }
+        }
+      }
+      Item {
+        anchors.right: parent.right
+        anchors.bottom: parent.bottom
+        width: 24
+        height: 24
+        z: 3
+        Text { anchors.centerIn: parent; text: "◢"; color: root.softInk; font.pixelSize: 16 }
+        MouseArea {
+          anchors.fill: parent
+          cursorShape: Qt.SizeFDiagCursor
+          property real startX: 0
+          property real startY: 0
+          property real startWidth: 0
+          property real startHeight: 0
+          onPressed: function(mouse) {
+            var point = mapToItem(window.contentItem, mouse.x, mouse.y)
+            startX = point.x
+            startY = point.y
+            startWidth = cellViewerDialog.width
+            startHeight = cellViewerDialog.height
+          }
+          onPositionChanged: function(mouse) {
+            if (!pressed) return
+            var point = mapToItem(window.contentItem, mouse.x, mouse.y)
+            root.viewerWidth = Math.max(500, Math.min(window.width - 48, startWidth + point.x - startX))
+            root.viewerHeight = Math.max(340, Math.min(window.height - 48, startHeight + point.y - startY))
+          }
+        }
+      }
+      }
+      onClosed: {
+        root.viewerGeneration++
+        root.viewedCell = null
+        root.viewedSnapshot = null
+        root.viewerText = ""
+        root.viewerJsonText = ""
+        root.viewerComplete = false
+        root.viewerLoading = false
+        viewerSearch.text = ""
       }
     }
 
@@ -1906,6 +2308,18 @@ Item {
           Text { Layout.fillWidth: true; visible: connectionStringInput.text.trim() === "" && !sslCheck.checked; text: "TLS is off. Credentials and data may travel in plaintext."; textFormat: Text.PlainText; color: Color.urgent; font.family: root.uiFont; font.pixelSize: Math.max(12, Style.font.caption); wrapMode: Text.WordWrap }
           StudioCheck { id: rememberCheck; text: "Remember connection in system keyring"; checked: true }
           Text { Layout.fillWidth: true; text: "Without Remember, this connection works for this session and disappears when DB Studio closes."; color: root.softInk; font.family: root.uiFont; font.pixelSize: Math.max(12, Style.font.caption); wrapMode: Text.WordWrap }
+          StudioCheck { id: agentAccessCheck; text: "Allow AI agents to use this connection"; checked: false; enabled: rememberCheck.checked }
+          Text {
+            Layout.fillWidth: true
+            text: agentAccessCheck.checked && rememberCheck.checked
+              ? "DB Studio MCP and CLI agents can inspect this database and run SQL with this account's permissions, including changes. Results may go to your AI provider. DB Studio tool responses do not include credentials. An agent with shell access under your user account may still access local files or the keyring. Disabling this stops new DB Studio agent requests; queries already running may finish."
+              : "Only remembered connections can be enabled for AI agents."
+            textFormat: Text.PlainText
+            color: agentAccessCheck.checked && rememberCheck.checked ? Color.urgent : root.softInk
+            font.family: root.uiFont
+            font.pixelSize: Math.max(12, Style.font.caption)
+            wrapMode: Text.WordWrap
+          }
           Text { id: formError; Layout.fillWidth: true; color: Color.urgent; font.family: root.uiFont; font.pixelSize: Math.max(13, Style.font.bodySmall); wrapMode: Text.WordWrap }
           RowLayout {
             Layout.fillWidth: true
@@ -1962,7 +2376,7 @@ Item {
                     Layout.fillWidth: true
                     spacing: 2
                     Text { Layout.fillWidth: true; text: profileRow.modelData.name; textFormat: Text.PlainText; color: root.ink; font.family: root.uiFont; font.pixelSize: Math.max(15, Style.font.body); font.bold: true; elide: Text.ElideRight }
-                    Text { text: root.engineName(profileRow.modelData.type); color: root.softInk; font.family: root.uiFont; font.pixelSize: Math.max(12, Style.font.caption) }
+                    Text { text: root.engineName(profileRow.modelData.type) + (profileRow.modelData.agentAccess ? " · AI access on" : ""); color: root.softInk; font.family: root.uiFont; font.pixelSize: Math.max(12, Style.font.caption) }
                   }
                   StudioButton { label: "Connect"; compact: true; onClicked: { connectionListDialog.close(); root.openProfile(profileRow.modelData) } }
                   StudioButton { label: "Duplicate"; compact: true; onClicked: root.duplicateProfile(profileRow.modelData) }
@@ -2015,6 +2429,8 @@ Item {
         Text { text: "Settings"; color: root.ink; font.family: root.uiFont; font.pixelSize: Math.max(21, Style.font.heading + 3); font.bold: true }
         RowLayout { Layout.fillWidth: true; Text { text: "Default result limit"; color: root.ink; font.family: root.uiFont; font.pixelSize: Math.max(14, Style.font.body) } Item { Layout.fillWidth: true } SpinBox { from: 1; to: 1000; stepSize: 25; editable: true; value: root.rowLimit; onValueModified: root.setRowLimit(value) } }
         Text { Layout.fillWidth: true; text: "Every SQL result and table page stops at this many rows (1–1000). The default is 100."; color: root.softInk; font.family: root.uiFont; font.pixelSize: Math.max(13, Style.font.bodySmall); wrapMode: Text.WordWrap }
+        StudioCheck { id: reopenCheck; text: "Reopen last connection automatically"; checked: root.reopenLastConnection; enabled: root.settingsLoaded; onToggled: root.setReopenLastConnection(checked) }
+        Text { Layout.fillWidth: true; text: "When DB Studio opens, reconnect to the last remembered profile if it is available. Session-only connections cannot be reopened."; color: root.softInk; font.family: root.uiFont; font.pixelSize: Math.max(13, Style.font.bodySmall); wrapMode: Text.WordWrap }
         RowLayout { Layout.fillWidth: true; Text { text: "Query timeout (seconds)"; color: root.ink; font.family: root.uiFont; font.pixelSize: Math.max(14, Style.font.body) } Item { Layout.fillWidth: true } SpinBox { from: 5; to: 120; value: root.timeoutMs / 1000; onValueModified: root.timeoutMs = value * 1000 } }
         Text { Layout.fillWidth: true; text: "Data browsing is view only in v1. Row editing will be added later."; color: root.softInk; font.family: root.uiFont; font.pixelSize: Math.max(13, Style.font.bodySmall); wrapMode: Text.WordWrap }
         RowLayout { Layout.fillWidth: true; Item { Layout.fillWidth: true } StudioButton { label: "Done"; prominent: true; onClicked: settingsDialog.close() } }

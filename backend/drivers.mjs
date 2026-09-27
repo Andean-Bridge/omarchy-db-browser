@@ -28,12 +28,14 @@ const sqlIdentifier = value => `[${identifier(value, 'identifier').replaceAll(']
 const pgIdentifier = value => `"${identifier(value, 'identifier').replaceAll('"', '""')}"`;
 const myIdentifier = value => `\`${identifier(value, 'identifier').replaceAll('`', '``')}\``;
 
-export function cell(value) {
+function cellDetail(value) {
   if (value === null || value === undefined) return null;
   if (value instanceof Date) return value.toISOString();
   if (Buffer.isBuffer(value)) {
     const suffix = value.length > 4096 ? `… (${value.length} bytes)` : '';
-    return `0x${value.subarray(0, 4096).toString('hex')}${suffix}`;
+    return value.length > 4096
+      ? { preview: `0x${value.subarray(0, 4096).toString('hex')}${suffix}`, byteLength: value.length }
+      : `0x${value.toString('hex')}`;
   }
   if (typeof value === 'bigint') return value.toString();
   if (typeof value === 'number' || typeof value === 'boolean') return value;
@@ -42,16 +44,39 @@ export function cell(value) {
   else {
     try { text = JSON.stringify(value); }
     catch { text = String(value); }
+    if (typeof text !== 'string') text = String(value);
   }
-  return text.length > MAX_CELL_LENGTH ? text.slice(0, MAX_CELL_LENGTH) + '…' : text;
+  return text.length > MAX_CELL_LENGTH
+    ? { preview: text.slice(0, MAX_CELL_LENGTH) + '…', text, byteLength: Buffer.byteLength(text, 'utf8') }
+    : text;
 }
 
-function appendRow(rows, raw, budget) {
-  const mapped = raw.map(cell);
-  const bytes = Buffer.byteLength(JSON.stringify(mapped));
+export function cell(value) {
+  const detail = cellDetail(value);
+  return detail && typeof detail === 'object' && 'preview' in detail ? detail.preview : detail;
+}
+
+export function appendRow(rows, raw, budget, cellRefs = [], cellBatch = null) {
+  const details = raw.map(cellDetail);
+  const mapped = details.map(detail => detail && typeof detail === 'object' && 'preview' in detail ? detail.preview : detail);
+  const rowIndex = rows.length;
+  const refBytes = details.reduce((size, detail, columnIndex) => {
+    if (!detail || typeof detail !== 'object' || !('preview' in detail)) return size;
+    return size + Buffer.byteLength(JSON.stringify({
+      row: rowIndex, column: columnIndex,
+      handle: '00000000-0000-0000-0000-000000000000',
+      byteLength: detail.byteLength, complete: false
+    })) + 1;
+  }, 0);
+  const bytes = Buffer.byteLength(JSON.stringify(mapped)) + refBytes;
   if (budget.bytes + bytes > MAX_RESULT_BYTES) return false;
   budget.bytes += bytes;
   rows.push(mapped);
+  details.forEach((detail, columnIndex) => {
+    if (!detail || typeof detail !== 'object' || !('preview' in detail)) return;
+    const handle = detail.text !== undefined ? cellBatch?.capture(detail.text, detail.byteLength) ?? null : null;
+    cellRefs.push({ row: rowIndex, column: columnIndex, handle, byteLength: detail.byteLength, complete: false });
+  });
   return true;
 }
 
@@ -169,13 +194,14 @@ async function sqlserver(profile, password) {
         indexes: groupIndexes(indexes)
       };
     },
-    rows(schema, name, limit, offset, onReady = () => {}) {
+    rows(schema, name, limit, offset, onReady = () => {}, cellBatch = null) {
       const request = new mssql.Request(pool);
       request.stream = true;
       request.arrayRowMode = true;
       request.input('offset', offset);
       request.input('count', limit + 1);
       const rows = [];
+      const cellRefs = [];
       const budget = { bytes: 0 };
       let columns = [];
       let hasMore = false;
@@ -197,7 +223,7 @@ async function sqlserver(profile, password) {
           else if (timedOut) reject(new Error('Query timed out.'));
           else if (oversizedRow) reject(oversizedRowError());
           else if (error && !internalCancel) reject(error);
-          else resolve({ columns, rows, limit, offset, hasMore });
+          else resolve({ columns, rows, cellRefs, limit, offset, hasMore });
         };
         request.on('recordset', meta => {
           if (!columns.length) columns = meta.map(item => column(item.name, item.type?.name));
@@ -205,7 +231,7 @@ async function sqlserver(profile, password) {
         request.on('row', row => {
           if (internalCancel || userCancel || timedOut) return;
           if (rows.length < limit) {
-            if (appendRow(rows, row, budget)) return;
+            if (appendRow(rows, row, budget, cellRefs, cellBatch)) return;
             if (rows.length === 0) oversizedRow = true;
           }
           hasMore = true;
@@ -221,11 +247,12 @@ async function sqlserver(profile, password) {
         } catch (error) { done(error); }
       });
     },
-    run(sql, limit, timeoutMs, onReady) {
+    run(sql, limit, timeoutMs, onReady, cellBatch = null) {
       const request = new mssql.Request(pool);
       request.stream = true;
       request.arrayRowMode = true;
       const rows = [];
+      const cellRefs = [];
       const budget = { bytes: 0 };
       let columns = [];
       let recordsets = 0;
@@ -246,7 +273,7 @@ async function sqlserver(profile, password) {
           if (userCancel) reject(new Error('Query cancelled.'));
           else if (timedOut) reject(new Error('Query timed out.'));
           else if (error && !(internalCancel && error.code === 'ECANCEL')) reject(queryError(error, sql, password));
-          else resolve({ columns, rows, rowCount: result?.rowsAffected?.reduce((a, b) => a + b, 0) ?? rowCount, hasMore });
+          else resolve({ columns, rows, cellRefs, rowCount: result?.rowsAffected?.reduce((a, b) => a + b, 0) ?? rowCount, hasMore });
         };
         request.on('recordset', meta => {
           recordsets += 1;
@@ -260,7 +287,7 @@ async function sqlserver(profile, password) {
             return;
           }
           rowCount += 1;
-          if (rows.length < limit && appendRow(rows, row, budget)) return;
+          if (rows.length < limit && appendRow(rows, row, budget, cellRefs, cellBatch)) return;
           if (!hasMore) { hasMore = true; internalCancel = true; request.cancel(); }
         });
         request.on('error', error => done(error));
@@ -341,9 +368,10 @@ async function postgres(profile, password) {
         FROM pg_indexes WHERE schemaname=$1 AND tablename=$2 ORDER BY indexname`, [schema, name]);
       return { columns, indexes };
     },
-    async rows(schema, name, limit, offset, onReady = () => {}) {
+    async rows(schema, name, limit, offset, onReady = () => {}, cellBatch = null) {
       const client = await pool.connect();
       const rows = [];
+      const cellRefs = [];
       const budget = { bytes: 0 };
       let columns = [];
       let hasMore = false;
@@ -378,7 +406,7 @@ async function postgres(profile, password) {
             if (!columns.length && meta?.fields) columns = meta.fields.map(field => column(field.name, String(field.dataTypeID)));
             if (internalCancel || userCancel || timedOut) return;
             if (rows.length < limit) {
-              if (appendRow(rows, row, budget)) return;
+              if (appendRow(rows, row, budget, cellRefs, cellBatch)) return;
               if (rows.length === 0) oversizedRow = true;
             }
             hasMore = true;
@@ -396,21 +424,22 @@ async function postgres(profile, password) {
         if (timedOut) throw new Error('Query timed out.');
         if (oversizedRow) throw oversizedRowError();
         reusable = !internalCancel;
-        return { columns, rows, limit, offset, hasMore };
+        return { columns, rows, cellRefs, limit, offset, hasMore };
       } catch (error) {
         if (userCancel) throw new Error('Query cancelled.');
         if (timedOut) throw new Error('Query timed out.');
         if (oversizedRow) throw oversizedRowError();
-        if (internalCancel) return { columns, rows, limit, offset, hasMore };
+        if (internalCancel) return { columns, rows, cellRefs, limit, offset, hasMore };
         throw error;
       } finally {
         clearTimeout(hardStopTimer);
         client.release(!reusable);
       }
     },
-    async run(sql, limit, timeoutMs, onReady) {
+    async run(sql, limit, timeoutMs, onReady, cellBatch = null) {
       const client = await pool.connect();
       const rows = [];
+      const cellRefs = [];
       const budget = { bytes: 0 };
       let columns = [];
       let rowCount = 0;
@@ -439,7 +468,7 @@ async function postgres(profile, password) {
             }
             if (!columns.length && resultMeta?.fields) columns = resultMeta.fields.map(field => column(field.name, String(field.dataTypeID)));
             rowCount += 1;
-            if (rows.length < limit && appendRow(rows, row, budget)) return;
+            if (rows.length < limit && appendRow(rows, row, budget, cellRefs, cellBatch)) return;
             if (!hasMore) { hasMore = true; internalCancel = true; void cancel(); }
           });
           query.on('error', reject);
@@ -449,10 +478,10 @@ async function postgres(profile, password) {
         const displayResult = firstResult || (Array.isArray(result) ? result.find(item => item.fields?.length) || result[0] : result);
         if (!columns.length) columns = displayResult?.fields?.map(field => column(field.name, String(field.dataTypeID))) || [];
         if (userCancel) throw new Error('Query cancelled.');
-        return { columns, rows, rowCount: displayResult?.rowCount ?? rowCount, hasMore };
+        return { columns, rows, cellRefs, rowCount: displayResult?.rowCount ?? rowCount, hasMore };
       } catch (error) {
         if (userCancel) throw new Error('Query cancelled.');
-        if (internalCancel && error.code === '57014') return { columns, rows, rowCount, hasMore };
+        if (internalCancel && error.code === '57014') return { columns, rows, cellRefs, rowCount, hasMore };
         throw queryError(error, sql, password);
       } finally {
         client.release(true);
@@ -508,11 +537,12 @@ async function mysql(profile, password) {
         ORDER BY INDEX_NAME,SEQ_IN_INDEX`, [schema, name]);
       return { columns: columns.map(row => ({ ...row, nullable: Boolean(row.nullable), primaryKey: Boolean(row.primaryKey) })), indexes: groupIndexes(indexes) };
     },
-    rows(schema, name, limit, offset, onReady = () => {}) {
+    rows(schema, name, limit, offset, onReady = () => {}, cellBatch = null) {
       return new Promise((resolve, reject) => {
         pool.getConnection((connectionError, connection) => {
           if (connectionError) { reject(connectionError); return; }
           const rows = [];
+          const cellRefs = [];
           const budget = { bytes: 0 };
           let columns = [];
           let hasMore = false;
@@ -538,7 +568,7 @@ async function mysql(profile, password) {
             if (userCancel) reject(new Error('Query cancelled.'));
             else if (oversizedRow) reject(oversizedRowError());
             else if (error && !internalCancel) reject(error);
-            else resolve({ columns, rows, limit, offset, hasMore });
+            else resolve({ columns, rows, cellRefs, limit, offset, hasMore });
           };
           try {
             onReady(() => { userCancel = true; if (queryStarted) cancel(); });
@@ -552,7 +582,7 @@ async function mysql(profile, password) {
             query.on('result', row => {
               if (internalCancel || userCancel) return;
               if (rows.length < limit) {
-                if (appendRow(rows, row, budget)) return;
+                if (appendRow(rows, row, budget, cellRefs, cellBatch)) return;
                 if (rows.length === 0) oversizedRow = true;
               }
               hasMore = true;
@@ -565,11 +595,12 @@ async function mysql(profile, password) {
         });
       });
     },
-    run(sql, limit, timeoutMs, onReady) {
+    run(sql, limit, timeoutMs, onReady, cellBatch = null) {
       return new Promise((resolve, reject) => {
         pool.getConnection((connectionError, connection) => {
           if (connectionError) { reject(queryError(connectionError, sql, password)); return; }
           const rows = [];
+          const cellRefs = [];
           const budget = { bytes: 0 };
           let columns = [];
           let recordsets = 0;
@@ -589,7 +620,7 @@ async function mysql(profile, password) {
             connection.destroy();
             if (userCancel) reject(new Error('Query cancelled.'));
             else if (error && !(internalCancel && error.code === 'ER_QUERY_INTERRUPTED')) reject(queryError(error, sql, password));
-            else resolve({ columns, rows, rowCount: result?.affectedRows ?? rowCount, hasMore });
+            else resolve({ columns, rows, cellRefs, rowCount: result?.affectedRows ?? rowCount, hasMore });
           };
           if (userCancel) { finish(new Error('Query cancelled.')); return; }
           const query = connection.query({ sql, rowsAsArray: true, timeout: timeoutMs });
@@ -607,7 +638,7 @@ async function mysql(profile, password) {
               return;
             }
             rowCount += 1;
-            if (rows.length < limit && appendRow(rows, row, budget)) return;
+            if (rows.length < limit && appendRow(rows, row, budget, cellRefs, cellBatch)) return;
             if (!hasMore) { hasMore = true; internalCancel = true; cancel(); }
           });
           query.on('error', error => finish(error));

@@ -1,8 +1,9 @@
-import { spawn } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { readFile, mkdtemp, rm } from 'node:fs/promises';
 import { homedir, tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { promisify } from 'node:util';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const MAX_CATALOG_CHARS = 18000;
@@ -11,6 +12,7 @@ const MAX_SQL_CHARS = 50000;
 const MAX_INSTRUCTION_CHARS = 4000;
 const MAX_DETAILS = 8;
 const MODEL_TIMEOUT_MS = 180000;
+const runFile = promisify(execFile);
 
 function envForAgent(source) {
   const keys = [
@@ -28,6 +30,23 @@ export async function omarchyDefaultAgent({ home = homedir(), read = readFile } 
     if (error?.code === 'ENOENT') return '';
     throw new Error('AI could not read the Omarchy default agent.');
   }
+}
+
+export async function codexReady({ environment = process.env, run = runFile } = {}) {
+  try {
+    await run('codex', ['login', 'status'], {
+      env: envForAgent(environment), timeout: 5000, maxBuffer: 8192
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export async function aiAvailability({ readAgent = omarchyDefaultAgent, checkCodex = codexReady } = {}) {
+  const agent = await readAgent();
+  if (agent !== 'codex') return { available: false, agent };
+  return { available: await checkCodex(), agent };
 }
 
 export function compactCatalog(objects, selected = null, searchText = '') {
@@ -153,16 +172,18 @@ const dialects = {
 };
 
 export async function generateAiQuery({ connection, instruction, sql = '', error = '', selected = null, signal,
-  readAgent = omarchyDefaultAgent, runModel = runCodex }) {
+  readAgent = omarchyDefaultAgent, checkCodex = codexReady, runModel = runCodex }) {
   if (typeof instruction !== 'string' || !instruction.trim() || instruction.length > MAX_INSTRUCTION_CHARS) {
     throw new Error('AI prompt must be 1 to 4,000 characters.');
   }
   if (typeof sql !== 'string' || sql.length > MAX_SQL_CHARS) {
     throw new Error('AI can use queries up to 50,000 characters. Shorten this query first.');
   }
-  const agent = await readAgent();
+  const availability = await aiAvailability({ readAgent, checkCodex });
+  const agent = availability.agent;
   if (!agent) throw new Error('AI is not configured. Choose an Omarchy default agent first.');
   if (agent !== 'codex') throw new Error(`AI support for Omarchy's ${agent} agent is not available yet.`);
+  if (!availability.available) throw new Error('AI agent Codex is not installed or signed in.');
   const dialect = dialects[connection.profile.type];
   if (!dialect) throw new Error('AI does not support this database type.');
   const rawObjects = await connection.adapter.objects();

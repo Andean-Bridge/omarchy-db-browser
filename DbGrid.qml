@@ -9,6 +9,7 @@ Item {
   id: grid
   property var columns: []
   property var rows: []
+  property var cellRefs: []
   property bool busy: false
   property bool hasMore: false
   property int offset: 0
@@ -16,8 +17,13 @@ Item {
   property string error: ""
   property string emptyText: "No rows returned"
   property bool paged: false
+  property int selectedRow: -1
+  property int selectedColumn: -1
   signal nextPage()
   signal previousPage()
+  signal viewCell(var cell)
+  signal copyCell(var cell)
+  signal copyColumnName(string name)
 
   readonly property color ink: Color.popups.text
   readonly property color mutedInk: Qt.rgba(ink.r, ink.g, ink.b, 0.58)
@@ -29,7 +35,68 @@ Item {
   readonly property int firstVisibleColumn: Math.max(0, Math.floor(horizontal.contentX / cellWidth) - 1)
   readonly property int lastVisibleColumn: Math.min(columns.length, Math.ceil((horizontal.contentX + horizontal.width) / cellWidth) + 1)
 
-  onColumnsChanged: horizontal.contentX = 0
+  onColumnsChanged: {
+    horizontal.contentX = 0
+    selectedRow = -1
+    selectedColumn = -1
+  }
+  onRowsChanged: {
+    selectedRow = -1
+    selectedColumn = -1
+  }
+  onOffsetChanged: {
+    selectedRow = -1
+    selectedColumn = -1
+  }
+
+  focus: true
+  Keys.onPressed: function(event) {
+    if (grid.selectedRow < 0 || grid.selectedColumn < 0) return
+    if ((event.modifiers & Qt.ControlModifier) && event.key === Qt.Key_C) {
+      grid.copyCell(grid.selectedCell())
+      event.accepted = true
+    } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
+      grid.viewCell(grid.selectedCell())
+      event.accepted = true
+    }
+  }
+
+  function selectCell(row, column) {
+    selectedRow = row
+    selectedColumn = column
+    forceActiveFocus()
+  }
+
+  function selectedCell() {
+    if (selectedRow < 0 || selectedColumn < 0 || selectedRow >= rows.length || selectedColumn >= columns.length) return null
+    var row = rows[selectedRow]
+    if (!row || selectedColumn >= row.length) return null
+    var rawValue = row[selectedColumn]
+    var ref = null
+    for (var i = 0; i < cellRefs.length; i++) {
+      if (cellRefs[i].row === selectedRow && cellRefs[i].column === selectedColumn) {
+        ref = cellRefs[i]
+        break
+      }
+    }
+    // Fail closed if an older worker supplied a preview without cellRefs.
+    var legacyPreview = !ref && typeof rawValue === "string" &&
+      ((rawValue.length === 4097 && rawValue.endsWith("…")) || /^0x[0-9a-f]{8192}… \(\d+ bytes\)$/.test(rawValue))
+    return {
+      row: selectedRow,
+      displayRow: offset + selectedRow + 1,
+      column: selectedColumn,
+      columnName: columnName(columns[selectedColumn]),
+      preview: cellText(rawValue),
+      complete: ref ? !!ref.complete : !legacyPreview,
+      handle: ref ? ref.handle : null,
+      byteLength: ref ? ref.byteLength : null
+    }
+  }
+  function canCopySelectedCell() {
+    var selected = selectedCell()
+    return !!selected && (selected.complete || !!selected.handle)
+  }
 
   function scrollHorizontally(delta) {
     var maxX = Math.max(0, horizontal.contentWidth - horizontal.width)
@@ -64,6 +131,41 @@ Item {
     if (value === null || value === undefined) return "NULL"
     if (typeof value === "object") return JSON.stringify(value)
     return String(value)
+  }
+
+  component CellAction: MenuItem {
+    id: action
+    implicitHeight: 38
+    contentItem: Text {
+      text: action.text
+      textFormat: Text.PlainText
+      color: action.enabled ? grid.ink : grid.mutedInk
+      font.family: Style.font.family
+      font.pixelSize: Math.max(13, Style.font.bodySmall)
+      verticalAlignment: Text.AlignVCenter
+      leftPadding: 12
+    }
+    background: Rectangle { color: action.highlighted ? grid.stripe : grid.surface }
+  }
+
+  Menu {
+    id: cellMenu
+    background: Rectangle { color: grid.surface; border.width: 1; border.color: grid.line; radius: 5 }
+    CellAction {
+      text: "View value"
+      enabled: grid.selectedRow >= 0
+      onTriggered: grid.viewCell(grid.selectedCell())
+    }
+    CellAction {
+      text: "Copy value"
+      enabled: grid.canCopySelectedCell()
+      onTriggered: grid.copyCell(grid.selectedCell())
+    }
+    CellAction {
+      text: "Copy column name"
+      enabled: grid.selectedColumn >= 0
+      onTriggered: grid.copyColumnName(grid.columnName(grid.columns[grid.selectedColumn]))
+    }
   }
 
   ColumnLayout {
@@ -159,9 +261,11 @@ Item {
                   width: grid.cellWidth
                   height: 39
                   clip: true
-                  color: rowDelegate.index % 2 === 0 ? "transparent" : grid.stripe
+                  color: grid.selectedRow === rowDelegate.index && grid.selectedColumn === bodyCell.modelData
+                    ? Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.24)
+                    : rowDelegate.index % 2 === 0 ? "transparent" : grid.stripe
                   border.width: 1
-                  border.color: grid.line
+                  border.color: grid.selectedRow === rowDelegate.index && grid.selectedColumn === bodyCell.modelData ? Color.accent : grid.line
                   Text {
                     id: cellTextItem
                     anchors.fill: parent
@@ -174,20 +278,26 @@ Item {
                     font.family: Style.font.family
                     font.pixelSize: Math.max(14, Style.font.body)
                     elide: Text.ElideRight
-                    ToolTip {
-                      visible: cellHover.hovered && cellTextItem.truncated
-                      delay: 400
-                      contentItem: Text {
-                        text: cellTextItem.text.length > 2000 ? cellTextItem.text.slice(0, 2000) + "…" : cellTextItem.text
-                        textFormat: Text.PlainText
-                        color: grid.ink
-                        font.family: Style.font.family
-                        font.pixelSize: Math.max(13, Style.font.bodySmall)
-                        wrapMode: Text.WrapAnywhere
-                        width: Math.min(600, implicitWidth)
+                  }
+                  MouseArea {
+                    anchors.fill: parent
+                    acceptedButtons: Qt.LeftButton | Qt.RightButton
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: function(mouse) {
+                      grid.selectCell(rowDelegate.index, bodyCell.modelData)
+                      if (mouse.button === Qt.RightButton) {
+                        var point = bodyCell.mapToItem(grid, mouse.x, mouse.y)
+                        cellMenu.x = point.x
+                        cellMenu.y = point.y
+                        cellMenu.popup()
                       }
                     }
-                    HoverHandler { id: cellHover }
+                    onDoubleClicked: function(mouse) {
+                      if (mouse.button !== Qt.LeftButton) return
+                      grid.selectCell(rowDelegate.index, bodyCell.modelData)
+                      grid.viewCell(grid.selectedCell())
+                    }
+                    onWheel: function(wheel) { wheel.accepted = false }
                   }
                 }
               }
@@ -310,7 +420,7 @@ Item {
       }
       Item { Layout.fillWidth: true }
       Button { text: "Previous"; enabled: !grid.busy && grid.offset > 0; onClicked: grid.previousPage() }
-      Button { text: "Next"; enabled: !grid.busy && grid.hasMore; onClicked: grid.nextPage() }
+      Button { text: "Next"; enabled: !grid.busy && grid.hasMore && grid.rows.length > 0; onClicked: grid.nextPage() }
     }
   }
 }

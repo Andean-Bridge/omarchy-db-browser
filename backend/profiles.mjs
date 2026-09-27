@@ -57,7 +57,8 @@ function cleanMeta(item) {
   if (typeof item.name !== 'string' || !item.name.trim() || item.name.length > 100) {
     throw new Error('Connection profiles file has an invalid name.');
   }
-  return { id: item.id, name: item.name.trim(), type: normalizeType(item.type), hasStoredConnection: true };
+  return { id: item.id, name: item.name.trim(), type: normalizeType(item.type), hasStoredConnection: true,
+    agentAccess: item.agentAccess === true };
 }
 
 function validateName(name) {
@@ -145,7 +146,7 @@ export class ProfileStore {
     await fs.chmod(directory, 0o700);
     const temp = `${this.filePath}.${randomUUID()}.tmp`;
     try {
-      const metadata = profiles.map(({ id, name, type }) => ({ id, name, type }));
+      const metadata = profiles.map(({ id, name, type, agentAccess }) => ({ id, name, type, agentAccess: agentAccess === true }));
       await fs.writeFile(temp, JSON.stringify({ version: 1, profiles: metadata }, null, 2) + '\n', { mode: 0o600, flag: 'wx' });
       await fs.chmod(temp, 0o600);
       await fs.rename(temp, this.filePath);
@@ -175,6 +176,9 @@ export class ProfileStore {
   async save(payload) {
     return this.#serial(async () => {
       if (!payload || typeof payload !== 'object') throw new Error('Invalid connection profile.');
+      if (payload.agentAccess !== undefined && typeof payload.agentAccess !== 'boolean') {
+        throw new Error('Invalid AI agent access setting.');
+      }
       const input = payload.profile || {};
       const name = validateName(input.name);
       const type = normalizeType(input.type);
@@ -182,6 +186,7 @@ export class ProfileStore {
       const existing = input.id ? (this.sessionProfiles.get(input.id) || persisted.find(item => item.id === input.id)) : null;
       if (input.id && !existing) throw new Error('Connection profile not found.');
       const id = existing?.id || randomUUID();
+      const agentAccess = payload.agentAccess === undefined ? existing?.agentAccess === true : payload.agentAccess;
       let definition = definitionFromPayload(payload, type, name);
       if (!definition) {
         if (!existing || existing.type !== type) throw new Error('Enter connection details.');
@@ -209,7 +214,7 @@ export class ProfileStore {
       }
       const index = persisted.findIndex(item => item.id === id);
       if (credentialSaved) {
-        const item = { id, name, type, hasStoredConnection: true };
+        const item = { id, name, type, hasStoredConnection: true, agentAccess };
         if (index >= 0) persisted[index] = item;
         else persisted.push(item);
         try { await this.#write(persisted); }
@@ -233,7 +238,7 @@ export class ProfileStore {
         }
       }
       this.sessionDefinitions.set(id, definition);
-      const item = { id, name, type, hasStoredConnection: false };
+      const item = { id, name, type, hasStoredConnection: false, agentAccess: false };
       this.sessionProfiles.set(id, item);
       return { profile: item, credentialSaved: false, ...(warning ? { warning } : {}) };
     });
@@ -260,7 +265,8 @@ export class ProfileStore {
         id: randomUUID(),
         name: duplicateName(source.name, [...persisted, ...this.sessionProfiles.values()]),
         type: source.type,
-        hasStoredConnection: source.hasStoredConnection
+        hasStoredConnection: source.hasStoredConnection,
+        agentAccess: false
       };
       if (source.hasStoredConnection) {
         try { await this.keyring.store(copy.id, definition); }
@@ -298,8 +304,11 @@ export class ProfileStore {
     });
   }
 
-  async credentials(id, { password, connectionString } = {}) {
+  async credentials(id, { password, connectionString, requireAgentAccess = false } = {}) {
     const meta = await this.get(id);
+    if (requireAgentAccess && (!meta.hasStoredConnection || meta.agentAccess !== true)) {
+      throw new Error('Saved connection profile not found.');
+    }
     if (password !== undefined && typeof password !== 'string') throw new Error('Password must be text.');
     if (connectionString !== undefined) {
       if (typeof connectionString !== 'string') throw new Error('Connection string must be text.');
