@@ -1,6 +1,7 @@
 pragma ComponentBehavior: Bound
 import QtQuick
 import QtQuick.Controls
+import QtQuick.Dialogs
 import QtQuick.Layouts
 import Quickshell
 import Quickshell.Io
@@ -86,6 +87,28 @@ Item {
   property int aiStatusVersion: 0
   property int aiRequestId: 0
   property int aiGeneration: 0
+  property string diffSourceProfileId: ""
+  property string diffTargetProfileId: ""
+  property var diffCatalog: null
+  property var diffSelectedSchemas: []
+  property var diffSelectedObjects: ({})
+  property var diffExpandedSchemas: ({})
+  property string diffFilter: ""
+  property string diffPhase: "setup"
+  property bool diffBusy: false
+  property string diffError: ""
+  property var diffResult: null
+  property var diffIncluded: ({})
+  property string diffFocusedKey: ""
+  property var diffPreview: null
+  property bool diffPreviewBusy: false
+  property int diffPreviewGeneration: 0
+  property string diffViewSide: "changes"
+  property string diffDetailTab: "difference"
+  property string diffScript: ""
+  property bool diffScriptComplete: false
+  property var diffManual: []
+  property int diffGeneration: 0
 
   readonly property color bg: Color.popups.background
   readonly property color ink: Color.popups.text
@@ -109,6 +132,212 @@ Item {
   function engineName(type) {
     var found = engineOptions.find(function(entry) { return entry.value === type })
     return found ? found.label : String(type || "Database")
+  }
+  function diffProfiles() {
+    return profiles.filter(function(profile) { return profile.type === "sqlserver" || profile.type === "azure_sql" })
+  }
+  function diffProfileIndex(id) {
+    return id ? diffProfiles().findIndex(function(profile) { return profile.id === id }) + 1 : 0
+  }
+  function resetDiffResults() {
+    diffGeneration++
+    diffCatalog = null
+    diffSelectedSchemas = []
+    diffSelectedObjects = ({})
+    diffExpandedSchemas = ({})
+    diffFilter = ""
+    diffPhase = "setup"
+    diffBusy = false
+    diffError = ""
+    diffResult = null
+    diffIncluded = ({})
+    diffFocusedKey = ""
+    diffPreview = null
+    diffPreviewBusy = false
+    diffPreviewGeneration++
+    diffScript = ""
+    diffManual = []
+    diffScriptComplete = false
+  }
+  function openDiffDialog() {
+    resetDiffResults()
+    diffSourceProfileId = ""
+    diffTargetProfileId = ""
+    diffDialog.open()
+  }
+  function loadDiffCatalog() {
+    if (!diffSourceProfileId || !diffTargetProfileId || diffSourceProfileId === diffTargetProfileId || diffBusy) return
+    var generation = ++diffGeneration
+    diffBusy = true
+    diffError = ""
+    request("schemaDiff.catalog", { sourceProfileId: diffSourceProfileId, targetProfileId: diffTargetProfileId }, function(data, error) {
+      if (generation !== diffGeneration || !diffDialog.visible) return
+      diffBusy = false
+      if (error) { diffError = error; return }
+      diffCatalog = data
+      diffSelectedSchemas = (data.source.schemas || []).map(function(item) { return item.name })
+      var selected = ({})
+      ;(data.source.objects || []).forEach(function(object) { selected[JSON.stringify([object.schema, object.name])] = true })
+      diffSelectedObjects = selected
+      diffExpandedSchemas = ({})
+      diffPhase = "select"
+    })
+  }
+  function diffRows() {
+    if (!diffCatalog) return []
+    var rows = []
+    var needle = diffFilter.toLocaleLowerCase().trim()
+    var objects = diffCatalog.source.objects || []
+    ;(diffCatalog.source.schemas || []).forEach(function(schema) {
+      var children = objects.filter(function(object) { return object.schema === schema.name })
+      var matches = children.filter(function(object) { return object.name.toLocaleLowerCase().includes(needle) || object.schema.toLocaleLowerCase().includes(needle) })
+      if (needle && !matches.length && !schema.name.toLocaleLowerCase().includes(needle)) return
+      rows.push({ kind: "schema", name: schema.name, count: children.length })
+      if (diffExpandedSchemas[schema.name] || needle) {
+        ;(needle ? matches : children).forEach(function(object) { rows.push({ kind: "object", object: object }) })
+      }
+    })
+    return rows
+  }
+  function diffObjectKey(object) { return JSON.stringify([object.schema, object.name]) }
+  function diffChecked(row) {
+    return row.kind === "schema" ? diffSelectedSchemas.indexOf(row.name) >= 0 : !!diffSelectedObjects[diffObjectKey(row.object)]
+  }
+  function toggleDiffRow(row, checked) {
+    if (!diffCatalog) return
+    var selected = Object.assign({}, diffSelectedObjects)
+    var schemas = diffSelectedSchemas.slice()
+    if (row.kind === "schema") {
+      schemas = checked ? schemas.concat([row.name]).filter(function(name, index, list) { return list.indexOf(name) === index })
+        : schemas.filter(function(name) { return name !== row.name })
+      ;(diffCatalog.source.objects || []).forEach(function(object) {
+        if (object.schema === row.name) selected[diffObjectKey(object)] = checked
+      })
+    } else {
+      selected[diffObjectKey(row.object)] = checked
+      if (checked && schemas.indexOf(row.object.schema) < 0) schemas.push(row.object.schema)
+    }
+    diffSelectedObjects = selected
+    diffSelectedSchemas = schemas
+    diffResult = null
+    diffScript = ""
+    diffPhase = "select"
+  }
+  function selectAllDiff(checked) {
+    if (!diffCatalog) return
+    diffSelectedSchemas = checked ? diffCatalog.source.schemas.map(function(schema) { return schema.name }) : []
+    var selected = ({})
+    ;(diffCatalog.source.objects || []).forEach(function(object) { selected[diffObjectKey(object)] = checked })
+    diffSelectedObjects = selected
+    diffResult = null
+    diffScript = ""
+    diffPhase = "select"
+  }
+  function diffSelectedCount() {
+    if (!diffCatalog) return 0
+    return (diffCatalog.source.objects || []).filter(function(object) { return !!diffSelectedObjects[diffObjectKey(object)] }).length
+  }
+  function compareDiff() {
+    if (!diffCatalog || !diffSelectedSchemas.length || diffBusy) return
+    var generation = ++diffGeneration
+    diffBusy = true
+    diffError = ""
+    var selectedObjects = (diffCatalog.source.objects || []).filter(function(object) { return !!diffSelectedObjects[diffObjectKey(object)] })
+      .map(function(object) { return diffObjectKey(object) })
+    request("schemaDiff.compare", { sourceProfileId: diffSourceProfileId, targetProfileId: diffTargetProfileId,
+      selectedSchemas: diffSelectedSchemas, selectedObjects: selectedObjects }, function(data, error) {
+      if (generation !== diffGeneration || !diffDialog.visible) return
+      diffBusy = false
+      if (error) { diffError = error; return }
+      diffResult = data
+      var included = ({})
+      ;(data.changes || []).forEach(function(change) { included[diffObjectKey(change)] = true })
+      diffIncluded = included
+      diffFocusedKey = ""
+      diffPreview = null
+      diffPhase = "results"
+      var first = diffResultRows().find(function(row) { return row.kind === "object" })
+      if (first) focusDiffChange(first.key)
+    })
+  }
+  function diffResultRows() {
+    if (!diffResult) return []
+    var rows = []
+    var changes = diffResult.changes || []
+    ;[{ status: "missing", title: "Missing in Target" }, { status: "different", title: "Diff in Target" }].forEach(function(section) {
+      var sectionChanges = changes.filter(function(change) { return section.status === "missing" ? !change.targetExists : change.targetExists })
+      if (!sectionChanges.length) return
+      rows.push({ kind: "section", label: section.title, count: sectionChanges.length })
+      ;[{ type: "table", title: "Tables" }, { type: "view", title: "Views" }].forEach(function(group) {
+        var items = sectionChanges.filter(function(change) { return change.type === group.type }).sort(function(a, b) {
+          return (a.schema + "." + a.name).localeCompare(b.schema + "." + b.name, undefined, { sensitivity: "base" })
+        })
+        if (!items.length) return
+        var groupKey = section.status + ":" + group.type
+        rows.push({ kind: "group", label: group.title, groupKey: groupKey, count: items.length })
+        items.forEach(function(change) { rows.push({ kind: "object", key: diffObjectKey(change), groupKey: groupKey, change: change }) })
+      })
+    })
+    return rows
+  }
+  function diffGroupChanges(groupKey) {
+    if (!diffResult) return []
+    var parts = groupKey.split(":")
+    return (diffResult.changes || []).filter(function(change) {
+      return change.type === parts[1] && (parts[0] === "missing" ? !change.targetExists : change.targetExists)
+    })
+  }
+  function diffIncludedCount(groupKey) {
+    var changes = groupKey ? diffGroupChanges(groupKey) : diffResult ? diffResult.changes || [] : []
+    return changes.filter(function(change) { return !!diffIncluded[diffObjectKey(change)] }).length
+  }
+  function toggleDiffIncluded(key, checked) {
+    diffIncluded = Object.assign({}, diffIncluded, { [key]: checked })
+    diffScript = ""
+  }
+  function toggleDiffGroup(groupKey, checked) {
+    var included = Object.assign({}, diffIncluded)
+    diffGroupChanges(groupKey).forEach(function(change) { included[diffObjectKey(change)] = checked })
+    diffIncluded = included
+    diffScript = ""
+  }
+  function focusDiffChange(key) {
+    if (!diffResult || key === diffFocusedKey) return
+    diffFocusedKey = key
+    diffPreview = null
+    diffError = ""
+    diffViewSide = "changes"
+    diffDetailTab = "difference"
+    diffPreviewBusy = true
+    var generation = ++diffPreviewGeneration
+    request("schemaDiff.preview", { comparisonId: diffResult.comparisonId, objectKey: key }, function(data, error) {
+      if (generation !== diffPreviewGeneration || !diffDialog.visible) return
+      diffPreviewBusy = false
+      if (error) { diffError = error; return }
+      diffPreview = data
+    })
+  }
+  function generateDiffScript() {
+    if (!diffResult || diffBusy || diffIncludedCount() === 0) return
+    var generation = ++diffGeneration
+    diffBusy = true
+    diffError = ""
+    var selectedKeys = (diffResult.changes || []).filter(function(change) { return !!diffIncluded[diffObjectKey(change)] }).map(function(change) { return diffObjectKey(change) })
+    request("schemaDiff.script", { comparisonId: diffResult.comparisonId, selectedKeys: selectedKeys }, function(data, error) {
+      if (generation !== diffGeneration || !diffDialog.visible) return
+      diffBusy = false
+      if (error) { diffError = error; return }
+      diffScript = String(data.sql || "")
+      diffScriptComplete = data.complete === true
+      diffManual = data.manual || []
+      diffPhase = "script"
+    })
+  }
+  function saveDiffScript(filePath) {
+    if (!diffResult || !diffScript) return
+    request("schemaDiff.save", { comparisonId: diffResult.comparisonId, filePath: filePath }, function(_, error) {
+      if (!error) showNotice("Schema diff script saved", false)
+    })
   }
   function supportsDatabaseSwitch() {
     return !!activeProfile && (activeProfile.type === "azure_sql" || activeProfile.type === "sqlserver")
@@ -1190,6 +1419,7 @@ Item {
             Rectangle { Layout.preferredWidth: 1; Layout.preferredHeight: 28; color: root.line }
             StudioTab { label: "Workbench"; selectedTab: true; onClicked: {} }
             StudioTab { label: "Connections"; onClicked: connectionListDialog.open() }
+            StudioTab { label: "Schema diff"; onClicked: root.openDiffDialog() }
             StudioTab { label: "Settings"; onClicked: settingsDialog.open() }
             Item { Layout.fillWidth: true }
           }
@@ -1955,6 +2185,462 @@ Item {
           StudioButton { label: root.aiBusy ? "Cancel request" : "Cancel"; compact: true; onClicked: aiDialog.close() }
           StudioButton { label: "Generate"; compact: true; buttonEnabled: root.aiAvailable && !root.aiBusy && root.connectionId !== "" && aiPromptField.text.trim() !== ""; onClicked: root.generateAiQuery() }
           StudioButton { label: "Use in editor"; compact: true; prominent: true; buttonEnabled: root.aiDraft !== "" && !root.aiBusy; onClicked: root.useAiQuery() }
+        }
+      }
+    }
+
+    FileDialog {
+      id: diffSaveDialog
+      title: "Save schema diff script"
+      fileMode: FileDialog.SaveFile
+      defaultSuffix: "sql"
+      nameFilters: ["SQL script (*.sql)"]
+      onAccepted: root.saveDiffScript(decodeURIComponent(String(selectedFile).replace(/^file:\/\//, "")))
+    }
+
+    Dialog {
+      id: diffTargetOnlyDialog
+      parent: window.contentItem
+      modal: true
+      title: "Only in target"
+      anchors.centerIn: parent
+      width: Math.min(640, window.width - 72)
+      height: Math.min(520, window.height - 72)
+      padding: 16
+      Overlay.modal: Rectangle { color: Qt.rgba(0, 0, 0, 0.46) }
+      background: Rectangle { color: root.bg; border.width: 1; border.color: root.accent; radius: 8 }
+      header: Rectangle {
+        implicitHeight: 55
+        color: root.raised
+        RowLayout {
+          anchors.fill: parent
+          anchors.leftMargin: 16
+          anchors.rightMargin: 16
+          Text { Layout.fillWidth: true; text: "Only in target · left unchanged"; color: root.ink; font.family: root.uiFont; font.pixelSize: Math.max(16, Style.font.body); font.bold: true }
+          StudioButton { label: "Close"; compact: true; onClicked: diffTargetOnlyDialog.close() }
+        }
+      }
+      contentItem: ListView {
+        clip: true
+        model: root.diffResult ? root.diffResult.targetOnly.slice().sort(function(a, b) { return (a.schema + "." + a.name).localeCompare(b.schema + "." + b.name, undefined, { sensitivity: "base" }) }) : []
+        ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+        delegate: RowLayout {
+          required property var modelData
+          width: ListView.view.width
+          height: 36
+          Text { Layout.fillWidth: true; text: modelData.schema + "." + modelData.name; textFormat: Text.PlainText; color: root.ink; font.family: root.codeFont; font.pixelSize: Math.max(13, Style.font.bodySmall); elide: Text.ElideRight }
+          Text { text: modelData.type; color: root.softInk; font.family: root.uiFont; font.pixelSize: Math.max(12, Style.font.caption) }
+        }
+      }
+    }
+
+    Dialog {
+      id: diffDialog
+      parent: window.contentItem
+      modal: true
+      title: "Schema diff"
+      anchors.centerIn: parent
+      width: Math.min(1000, window.width - 44)
+      height: Math.min(790, window.height - 44)
+      padding: 0
+      onClosed: { diffTargetOnlyDialog.close(); root.resetDiffResults() }
+      Overlay.modal: Rectangle { color: Qt.rgba(0, 0, 0, 0.56) }
+      background: Rectangle { color: root.bg; border.width: 2; border.color: Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.65); radius: 10 }
+      header: Rectangle {
+        implicitHeight: 62
+        color: root.raised
+        radius: 10
+        Rectangle { anchors.left: parent.left; anchors.right: parent.right; anchors.bottom: parent.bottom; height: 1; color: root.line }
+        RowLayout {
+          anchors.fill: parent
+          anchors.leftMargin: 20
+          anchors.rightMargin: 20
+          Text { Layout.fillWidth: true; text: "Schema diff"; color: root.ink; font.family: root.uiFont; font.pixelSize: Math.max(19, Style.font.heading); font.bold: true }
+          Text { text: "SQL Server · Azure SQL"; color: root.softInk; font.family: root.uiFont; font.pixelSize: Math.max(12, Style.font.caption) }
+          StudioButton { label: "Close"; compact: true; onClicked: diffDialog.close() }
+        }
+      }
+      contentItem: Item {
+        ColumnLayout {
+          anchors.fill: parent
+          anchors.margins: 20
+          spacing: 12
+          Text {
+            Layout.fillWidth: true
+            text: root.diffPhase === "setup" ? "Choose the source and target databases. The script will make the target match selected source objects."
+              : root.diffPhase === "select" ? "Select schemas, tables, and views. Only checked objects are compared; all start checked."
+              : root.diffPhase === "results" ? "Review the differences before generating a source-to-target script."
+              : "Review the SQL before saving or copying it. DB Studio will not run this script."
+            textFormat: Text.PlainText
+            color: root.ink
+            font.family: root.uiFont
+            font.pixelSize: Math.max(14, Style.font.body)
+            wrapMode: Text.WordWrap
+          }
+          Rectangle { Layout.fillWidth: true; Layout.preferredHeight: 1; color: root.line }
+          StackLayout {
+            Layout.fillWidth: true
+            Layout.fillHeight: true
+            currentIndex: root.diffPhase === "setup" ? 0 : root.diffPhase === "select" ? 1 : root.diffPhase === "results" ? 2 : 3
+
+            Item {
+              ColumnLayout {
+                anchors.fill: parent
+                spacing: 16
+                RowLayout {
+                  Layout.fillWidth: true
+                  spacing: 16
+                  ColumnLayout {
+                    Layout.fillWidth: true
+                    Text { text: "SOURCE"; color: root.accent; font.family: root.uiFont; font.pixelSize: Math.max(12, Style.font.caption); font.bold: true }
+                    ComboBox {
+                      id: diffSourcePicker
+                      Layout.fillWidth: true
+                      implicitHeight: 40
+                      model: [{ id: "", name: "Choose source…" }].concat(root.diffProfiles())
+                      textRole: "name"
+                      currentIndex: root.diffProfileIndex(root.diffSourceProfileId)
+                      onActivated: function(index) {
+                        var profile = root.diffProfiles()[index - 1]
+                        if (profile) { root.diffSourceProfileId = profile.id; root.resetDiffResults() }
+                      }
+                      contentItem: Text { text: diffSourcePicker.displayText; color: root.ink; font.family: root.uiFont; font.pixelSize: Math.max(14, Style.font.body); verticalAlignment: Text.AlignVCenter; leftPadding: 10; elide: Text.ElideRight }
+                      background: Rectangle { color: root.surface; border.width: 1; border.color: root.line; radius: 5 }
+                      delegate: ItemDelegate {
+                        id: sourceOption
+                        required property var modelData
+                        required property int index
+                        width: diffSourcePicker.width
+                        height: 38
+                        text: modelData.name
+                        contentItem: Text { text: sourceOption.text; color: root.ink; font.family: root.uiFont; font.pixelSize: Math.max(13, Style.font.bodySmall); verticalAlignment: Text.AlignVCenter; leftPadding: 10; elide: Text.ElideRight }
+                        background: Rectangle { color: diffSourcePicker.highlightedIndex === sourceOption.index ? root.selected : root.bg }
+                      }
+                      popup: Popup {
+                        y: diffSourcePicker.height - 1
+                        width: diffSourcePicker.width
+                        implicitHeight: Math.min(contentItem.implicitHeight + 8, 300)
+                        padding: 4
+                        contentItem: ListView { clip: true; implicitHeight: contentHeight; model: diffSourcePicker.popup.visible ? diffSourcePicker.delegateModel : null; currentIndex: diffSourcePicker.highlightedIndex; ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded } }
+                        background: Rectangle { color: root.bg; border.width: 1; border.color: root.accent; radius: 5 }
+                      }
+                    }
+                  }
+                  Text { text: "→"; color: root.accent; font.family: root.uiFont; font.pixelSize: 26 }
+                  ColumnLayout {
+                    Layout.fillWidth: true
+                    Text { text: "TARGET"; color: root.accent; font.family: root.uiFont; font.pixelSize: Math.max(12, Style.font.caption); font.bold: true }
+                    ComboBox {
+                      id: diffTargetPicker
+                      Layout.fillWidth: true
+                      implicitHeight: 40
+                      model: [{ id: "", name: "Choose target…" }].concat(root.diffProfiles())
+                      textRole: "name"
+                      currentIndex: root.diffProfileIndex(root.diffTargetProfileId)
+                      onActivated: function(index) {
+                        var profile = root.diffProfiles()[index - 1]
+                        if (profile) { root.diffTargetProfileId = profile.id; root.resetDiffResults() }
+                      }
+                      contentItem: Text { text: diffTargetPicker.displayText; color: root.ink; font.family: root.uiFont; font.pixelSize: Math.max(14, Style.font.body); verticalAlignment: Text.AlignVCenter; leftPadding: 10; elide: Text.ElideRight }
+                      background: Rectangle { color: root.surface; border.width: 1; border.color: root.line; radius: 5 }
+                      delegate: ItemDelegate {
+                        id: targetOption
+                        required property var modelData
+                        required property int index
+                        width: diffTargetPicker.width
+                        height: 38
+                        text: modelData.name
+                        contentItem: Text { text: targetOption.text; color: root.ink; font.family: root.uiFont; font.pixelSize: Math.max(13, Style.font.bodySmall); verticalAlignment: Text.AlignVCenter; leftPadding: 10; elide: Text.ElideRight }
+                        background: Rectangle { color: diffTargetPicker.highlightedIndex === targetOption.index ? root.selected : root.bg }
+                      }
+                      popup: Popup {
+                        y: diffTargetPicker.height - 1
+                        width: diffTargetPicker.width
+                        implicitHeight: Math.min(contentItem.implicitHeight + 8, 300)
+                        padding: 4
+                        contentItem: ListView { clip: true; implicitHeight: contentHeight; model: diffTargetPicker.popup.visible ? diffTargetPicker.delegateModel : null; currentIndex: diffTargetPicker.highlightedIndex; ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded } }
+                        background: Rectangle { color: root.bg; border.width: 1; border.color: root.accent; radius: 5 }
+                      }
+                    }
+                  }
+                }
+                Text {
+                  Layout.fillWidth: true
+                  text: root.diffProfiles().length < 2 ? "Add at least two SQL Server or Azure SQL connections to compare." :
+                    !root.diffSourceProfileId || !root.diffTargetProfileId ? "Choose both connections. The script applies changes to the target database." :
+                    root.diffSourceProfileId === root.diffTargetProfileId ? "Choose two different connections." :
+                    "The comparison reads schema metadata from both connections. No table rows are read."
+                  textFormat: Text.PlainText
+                  color: root.softInk
+                  font.family: root.uiFont
+                  font.pixelSize: Math.max(13, Style.font.bodySmall)
+                  wrapMode: Text.WordWrap
+                }
+                Item { Layout.fillHeight: true }
+              }
+            }
+
+            Item {
+              ColumnLayout {
+                anchors.fill: parent
+                spacing: 9
+                RowLayout {
+                  Layout.fillWidth: true
+                  Text { Layout.fillWidth: true; text: root.diffCatalog ? root.diffCatalog.sourceName + " (" + root.diffCatalog.sourceDatabase + ") → " + root.diffCatalog.targetName + " (" + root.diffCatalog.targetDatabase + ") · " + root.diffSelectedCount() + " objects checked" : ""; textFormat: Text.PlainText; color: root.ink; font.family: root.uiFont; font.pixelSize: Math.max(14, Style.font.body); font.bold: true; elide: Text.ElideRight }
+                  StudioButton { label: "Select all"; compact: true; onClicked: root.selectAllDiff(true) }
+                  StudioButton { label: "Clear all"; compact: true; onClicked: root.selectAllDiff(false) }
+                }
+                StudioField { Layout.fillWidth: true; placeholderText: "Filter schemas, tables, and views…"; text: root.diffFilter; onTextChanged: root.diffFilter = text }
+                Rectangle {
+                  Layout.fillWidth: true
+                  Layout.fillHeight: true
+                  color: root.surface
+                  border.width: 1
+                  border.color: root.line
+                  radius: 6
+                  ListView {
+                    anchors.fill: parent
+                    anchors.margins: 5
+                    clip: true
+                    spacing: 1
+                    model: root.diffRows()
+                    boundsBehavior: Flickable.StopAtBounds
+                    ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+                    delegate: Rectangle {
+                      id: diffSelectionRow
+                      required property var modelData
+                      readonly property bool schemaRow: modelData.kind === "schema"
+                      width: ListView.view.width
+                      height: 38
+                      color: diffRowHover.hovered ? root.raised : "transparent"
+                      radius: 5
+                      RowLayout {
+                        anchors.fill: parent
+                        anchors.leftMargin: diffSelectionRow.schemaRow ? 10 : 44
+                        anchors.rightMargin: 10
+                        spacing: 9
+                        Text {
+                          visible: diffSelectionRow.schemaRow
+                          text: root.diffExpandedSchemas[diffSelectionRow.modelData.name] ? "⌄" : "›"
+                          color: root.softInk
+                          font.pixelSize: 20
+                          MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: root.diffExpandedSchemas = Object.assign({}, root.diffExpandedSchemas, { [diffSelectionRow.modelData.name]: !root.diffExpandedSchemas[diffSelectionRow.modelData.name] }) }
+                        }
+                        StudioCheck { text: ""; checked: root.diffChecked(diffSelectionRow.modelData); onToggled: root.toggleDiffRow(diffSelectionRow.modelData, checked) }
+                        StudioIcon { Layout.preferredWidth: 16; Layout.preferredHeight: 16; iconName: diffSelectionRow.schemaRow ? "server-database" : diffSelectionRow.modelData.object.type === "view" ? "view-list-details" : "x-office-spreadsheet" }
+                        Text { Layout.fillWidth: true; text: diffSelectionRow.schemaRow ? diffSelectionRow.modelData.name : diffSelectionRow.modelData.object.name; textFormat: Text.PlainText; color: root.ink; font.family: root.uiFont; font.pixelSize: Math.max(14, Style.font.body); font.bold: diffSelectionRow.schemaRow; elide: Text.ElideRight }
+                        Text { text: diffSelectionRow.schemaRow ? String(diffSelectionRow.modelData.count) : diffSelectionRow.modelData.object.type; color: root.softInk; font.family: root.uiFont; font.pixelSize: Math.max(12, Style.font.caption) }
+                      }
+                      HoverHandler { id: diffRowHover }
+                    }
+                  }
+                }
+              }
+            }
+
+            Item {
+              ColumnLayout {
+                anchors.fill: parent
+                spacing: 10
+                RowLayout {
+                  Layout.fillWidth: true
+                  Text {
+                    Layout.fillWidth: true
+                    text: root.diffResult ? root.diffIncludedCount() + " of " + root.diffResult.changes.length + " changes selected · " + root.diffResult.unchanged + " unchanged" : ""
+                    color: root.ink
+                    font.family: root.uiFont
+                    font.pixelSize: Math.max(14, Style.font.body)
+                    font.bold: true
+                  }
+                  StudioButton { label: root.diffResult ? root.diffResult.targetOnly.length + " only in target" : ""; compact: true; visible: !!root.diffResult && root.diffResult.targetOnly.length > 0; onClicked: diffTargetOnlyDialog.open() }
+                }
+                RowLayout {
+                  Layout.fillWidth: true
+                  Layout.fillHeight: true
+                  spacing: 12
+                  Rectangle {
+                    Layout.preferredWidth: 365
+                    Layout.fillHeight: true
+                    color: root.surface
+                    border.width: 1
+                    border.color: root.line
+                    radius: 6
+                    ListView {
+                      anchors.fill: parent
+                      anchors.margins: 5
+                      clip: true
+                      spacing: 2
+                      model: root.diffResultRows()
+                      boundsBehavior: Flickable.StopAtBounds
+                      ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+                      delegate: Rectangle {
+                        id: diffResultRow
+                        required property var modelData
+                        readonly property bool objectRow: modelData.kind === "object"
+                        width: ListView.view.width
+                        height: modelData.kind === "section" ? 45 : modelData.kind === "group" ? 38 : 45
+                        color: modelData.kind === "section" ? root.raised : objectRow && root.diffFocusedKey === modelData.key ? root.selected : diffResultHover.hovered && objectRow ? root.raised : "transparent"
+                        border.width: objectRow && root.diffFocusedKey === modelData.key ? 1 : 0
+                        border.color: root.accent
+                        radius: 5
+                        RowLayout {
+                          anchors.fill: parent
+                          anchors.leftMargin: diffResultRow.modelData.kind === "section" ? 10 : 18
+                          anchors.rightMargin: 9
+                          spacing: 8
+                          StudioCheck {
+                            visible: diffResultRow.modelData.kind !== "section"
+                            text: ""
+                            checked: diffResultRow.modelData.kind === "group" ? root.diffIncludedCount(diffResultRow.modelData.groupKey) === diffResultRow.modelData.count : !!root.diffIncluded[diffResultRow.modelData.key]
+                            onToggled: {
+                              if (diffResultRow.modelData.kind === "group") root.toggleDiffGroup(diffResultRow.modelData.groupKey, checked)
+                              else root.toggleDiffIncluded(diffResultRow.modelData.key, checked)
+                            }
+                          }
+                          ColumnLayout {
+                            Layout.fillWidth: true
+                            spacing: 1
+                            Text {
+                              Layout.fillWidth: true
+                              text: diffResultRow.modelData.kind === "object" ? diffResultRow.modelData.change.schema + "." + diffResultRow.modelData.change.name : diffResultRow.modelData.label
+                              textFormat: Text.PlainText
+                              color: root.ink
+                              font.family: diffResultRow.objectRow ? root.codeFont : root.uiFont
+                              font.pixelSize: diffResultRow.modelData.kind === "section" ? Math.max(15, Style.font.body) : Math.max(13, Style.font.bodySmall)
+                              font.bold: !diffResultRow.objectRow
+                              elide: Text.ElideRight
+                            }
+                            Text {
+                              visible: diffResultRow.objectRow
+                              Layout.fillWidth: true
+                              text: diffResultRow.objectRow ? (diffResultRow.modelData.change.notes || []).join(" ") || (diffResultRow.modelData.change.status === "create" ? "Create" : diffResultRow.modelData.change.status === "manual" ? "Manual review" : "Modify") : ""
+                              textFormat: Text.PlainText
+                              color: root.softInk
+                              font.family: root.uiFont
+                              font.pixelSize: Math.max(11, Style.font.caption)
+                              elide: Text.ElideRight
+                            }
+                          }
+                          Text {
+                            text: diffResultRow.modelData.kind === "group" ? root.diffIncludedCount(diffResultRow.modelData.groupKey) + "/" + diffResultRow.modelData.count : diffResultRow.modelData.kind === "section" ? String(diffResultRow.modelData.count) : diffResultRow.modelData.change.status === "manual" ? "review" : diffResultRow.modelData.change.status
+                            color: diffResultRow.objectRow && diffResultRow.modelData.change.status === "manual" ? Color.urgent : root.accent
+                            font.family: root.uiFont
+                            font.pixelSize: Math.max(11, Style.font.caption)
+                          }
+                        }
+                        MouseArea {
+                          visible: diffResultRow.objectRow
+                          anchors.top: parent.top
+                          anchors.bottom: parent.bottom
+                          anchors.left: parent.left
+                          anchors.leftMargin: 47
+                          anchors.right: parent.right
+                          cursorShape: Qt.PointingHandCursor
+                          onClicked: root.focusDiffChange(diffResultRow.modelData.key)
+                        }
+                        HoverHandler { id: diffResultHover }
+                      }
+                    }
+                  }
+                  Rectangle {
+                    Layout.fillWidth: true
+                    Layout.fillHeight: true
+                    color: root.raised
+                    border.width: 1
+                    border.color: root.line
+                    radius: 6
+                    ColumnLayout {
+                      anchors.fill: parent
+                      anchors.margins: 12
+                      spacing: 8
+                      Text { Layout.fillWidth: true; text: root.diffPreview ? root.diffPreview.schema + "." + root.diffPreview.name : root.diffPreviewBusy ? "Loading change…" : "Select an object to inspect"; textFormat: Text.PlainText; color: root.ink; font.family: root.codeFont; font.pixelSize: Math.max(15, Style.font.body); font.bold: true; elide: Text.ElideRight }
+                      Text { Layout.fillWidth: true; visible: !!root.diffPreview; text: root.diffPreview ? (root.diffPreview.status === "manual" ? "Different in target · manual review" : (root.diffPreview.status === "create" ? "Missing in target · CREATE " : "Different in target · ALTER ") + root.diffPreview.type.toUpperCase() + (root.diffPreview.complete ? "" : " · manual review needed")) : ""; color: root.diffPreview && !root.diffPreview.complete ? Color.urgent : root.softInk; font.family: root.uiFont; font.pixelSize: Math.max(12, Style.font.bodySmall); wrapMode: Text.WordWrap }
+                      Text { Layout.fillWidth: true; visible: !!root.diffPreview && root.diffPreview.notes.length > 0; text: root.diffPreview ? root.diffPreview.notes.join(" ") : ""; color: root.softInk; font.family: root.uiFont; font.pixelSize: Math.max(12, Style.font.bodySmall); wrapMode: Text.WordWrap }
+                      RowLayout {
+                        Layout.fillWidth: true
+                        visible: !!root.diffPreview
+                        StudioButton { label: "Difference"; compact: true; prominent: root.diffDetailTab === "difference"; onClicked: root.diffDetailTab = "difference" }
+                        StudioButton { label: "SQL script"; compact: true; prominent: root.diffDetailTab === "sql"; onClicked: root.diffDetailTab = "sql" }
+                        Item { Layout.fillWidth: true }
+                      }
+                      RowLayout {
+                        Layout.fillWidth: true
+                        visible: !!root.diffPreview && root.diffPreview.type === "view" && root.diffDetailTab === "difference"
+                        Text { Layout.fillWidth: true; text: "View definition"; color: root.accent; font.family: root.uiFont; font.pixelSize: Math.max(12, Style.font.caption); font.bold: true }
+                        StudioButton { label: "Changes"; compact: true; prominent: root.diffViewSide === "changes"; onClicked: root.diffViewSide = "changes" }
+                        StudioButton { visible: !!root.diffPreview && root.diffPreview.type === "view"; label: "Source"; compact: true; prominent: root.diffViewSide === "source"; onClicked: root.diffViewSide = "source" }
+                        StudioButton { visible: !!root.diffPreview && root.diffPreview.type === "view"; label: "Target"; compact: true; prominent: root.diffViewSide === "target"; onClicked: root.diffViewSide = "target" }
+                      }
+                      ScrollView {
+                        Layout.fillWidth: true
+                        Layout.fillHeight: true
+                        visible: !!root.diffPreview
+                        clip: true
+                        TextArea {
+                          text: !root.diffPreview ? "" : root.diffDetailTab === "sql" ? root.diffPreview.sql : root.diffPreview.type === "view" ? (root.diffViewSide === "changes" ? root.diffPreview.viewDifference : root.diffViewSide === "source" ? root.diffPreview.sourceDefinition : root.diffPreview.targetDefinition || "(missing in target)") : root.diffPreview.columns.length ? root.diffPreview.columns.map(function(item) { return (item.action === "add" ? "+ " : item.action === "target-only" ? "= " : "~ ") + item.name + "\n  Target: " + (item.before || "(missing)") + "\n  Source: " + (item.after || "(absent; left unchanged)") }).join("\n\n") : "No column changes."
+                          textFormat: TextEdit.PlainText
+                          readOnly: true
+                          selectByMouse: true
+                          wrapMode: TextEdit.NoWrap
+                          color: root.ink
+                          font.family: root.codeFont
+                          font.pixelSize: Math.max(12, Style.font.bodySmall)
+                          background: Rectangle { color: root.bg; border.width: 1; border.color: root.line; radius: 5 }
+                        }
+                      }
+                    }
+                  }
+                }
+                Text { Layout.fillWidth: true; visible: !!root.diffResult && root.diffResult.changes.length === 0; text: "No differences in the selected objects."; color: root.softInk; font.family: root.uiFont; font.pixelSize: Math.max(14, Style.font.body) }
+              }
+            }
+
+            Item {
+              ColumnLayout {
+                anchors.fill: parent
+                spacing: 10
+                Text { Layout.fillWidth: true; text: root.diffScriptComplete ? "Script ready · no manual changes flagged" : "Script incomplete · " + root.diffManual.length + " changes need manual review"; color: root.diffScriptComplete ? root.ink : Color.urgent; font.family: root.uiFont; font.pixelSize: Math.max(14, Style.font.body); font.bold: true }
+                ScrollView {
+                  Layout.fillWidth: true
+                  Layout.fillHeight: true
+                  clip: true
+                  TextArea {
+                    text: root.diffScript
+                    textFormat: TextEdit.PlainText
+                    readOnly: true
+                    selectByMouse: true
+                    wrapMode: TextEdit.NoWrap
+                    color: root.ink
+                    selectionColor: root.accent
+                    selectedTextColor: root.bg
+                    font.family: root.codeFont
+                    font.pixelSize: Math.max(13, Style.font.bodySmall)
+                    background: Rectangle { color: root.surface; border.width: 1; border.color: root.line; radius: 6 }
+                  }
+                }
+              }
+            }
+          }
+          Text { Layout.fillWidth: true; visible: root.diffBusy || root.diffError !== ""; text: root.diffBusy ? "Reading schema metadata…" : root.diffError; textFormat: Text.PlainText; color: root.diffError ? Color.urgent : root.softInk; font.family: root.uiFont; font.pixelSize: Math.max(13, Style.font.bodySmall); wrapMode: Text.WordWrap }
+        }
+      }
+      footer: Rectangle {
+        implicitHeight: 62
+        color: root.raised
+        radius: 10
+        Rectangle { anchors.left: parent.left; anchors.right: parent.right; anchors.top: parent.top; height: 1; color: root.line }
+        RowLayout {
+          anchors.fill: parent
+          anchors.leftMargin: 20
+          anchors.rightMargin: 20
+          spacing: 9
+          StudioButton { label: "Back"; compact: true; visible: root.diffPhase === "results" || root.diffPhase === "script"; onClicked: root.diffPhase = root.diffPhase === "script" ? "results" : "select" }
+          Item { Layout.fillWidth: true }
+          StudioButton { label: "Load objects"; compact: true; prominent: true; visible: root.diffPhase === "setup"; buttonEnabled: !root.diffBusy && root.diffSourceProfileId !== "" && root.diffTargetProfileId !== "" && root.diffSourceProfileId !== root.diffTargetProfileId; onClicked: root.loadDiffCatalog() }
+          StudioButton { label: "Compare selected"; compact: true; prominent: true; visible: root.diffPhase === "select"; buttonEnabled: !root.diffBusy && root.diffSelectedSchemas.length > 0; onClicked: root.compareDiff() }
+          StudioButton { label: "Generate script"; compact: true; prominent: true; visible: root.diffPhase === "results"; buttonEnabled: !root.diffBusy && root.diffIncludedCount() > 0; onClicked: root.generateDiffScript() }
+          StudioButton { label: "Copy script"; compact: true; visible: root.diffPhase === "script"; buttonEnabled: root.diffScript !== ""; onClicked: root.copyPlainText(root.diffScript) }
+          StudioButton { label: "Save .sql"; compact: true; prominent: true; visible: root.diffPhase === "script"; buttonEnabled: root.diffScript !== ""; onClicked: diffSaveDialog.open() }
         }
       }
     }

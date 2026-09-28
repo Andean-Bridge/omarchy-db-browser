@@ -109,14 +109,25 @@ async function sqlserver(profile, password) {
   try { await pool.connect(); }
   catch { throw new Error('Could not connect to SQL Server. Check the address, credentials, and TLS settings.'); }
 
-  const metadata = async (text, params = {}) => {
+  const metadata = async (text, params = {}, timeoutMs = 10000) => {
     const request = new mssql.Request(pool);
     for (const [key, value] of Object.entries(params)) request.input(key, value);
-    const timer = setTimeout(() => request.cancel(), 10000);
+    const timer = setTimeout(() => request.cancel(), timeoutMs);
     try {
       const result = await request.query(text);
       return result.recordset || [];
     } finally { clearTimeout(timer); }
+  };
+
+  const diffMetadata = async (sql, objectIds) => {
+    const rows = [];
+    for (let start = 0; start < objectIds.length; start += 250) {
+      const batch = objectIds.slice(start, start + 250);
+      const params = Object.fromEntries(batch.map((objectId, index) => [`id${index}`, objectId]));
+      const placeholders = batch.map((_, index) => `@id${index}`).join(',');
+      rows.push(...await metadata(sql.replaceAll('/*OBJECT_IDS*/', placeholders), params, 30000));
+    }
+    return rows;
   };
 
   return {
@@ -193,6 +204,148 @@ async function sqlserver(profile, password) {
         })),
         indexes: groupIndexes(indexes)
       };
+    },
+    async diffCatalog() {
+      const [schemas, objects] = await Promise.all([
+        metadata("SELECT TOP (2001) name FROM sys.schemas WHERE name NOT IN ('sys','INFORMATION_SCHEMA') ORDER BY name", {}, 30000),
+        metadata(`SELECT TOP (10001) o.object_id AS objectId, s.name AS [schema], o.name,
+          CASE WHEN o.type='V' THEN 'view' ELSE 'table' END AS [type]
+          FROM sys.objects o JOIN sys.schemas s ON s.schema_id=o.schema_id
+          WHERE o.type IN ('U','V') AND s.name NOT IN ('sys','INFORMATION_SCHEMA')
+          ORDER BY s.name,o.name`, {}, 30000)
+      ]);
+      if (schemas.length > 2000 || objects.length > 10000) throw new Error('Could not compare schemas: database catalog exceeds the comparison limit.');
+      return { schemas: schemas.map(row => ({ name: row.name })), objects };
+    },
+    async diffDetails(objects) {
+      const ids = objects.map(object => object.objectId);
+      const details = Object.fromEntries(ids.map(id => [id, {
+        columns: [], indexes: [], checks: [], foreignKeys: [], incomingForeignKeys: [], dependencies: [],
+        definition: null, indexed: false, properties: {}
+      }]));
+      if (!ids.length) return details;
+      const [columns, indexes, checks, foreignKeys, views, tables, dependencies] = await Promise.all([
+        diffMetadata(`SELECT c.object_id AS objectId, c.column_id AS columnId, c.name,
+          t.name AS typeName, ts.name AS typeSchema, t.is_user_defined AS isUserDefined,
+          c.max_length AS maxLength, c.precision, c.scale, c.is_nullable AS nullable,
+          c.collation_name AS collation, c.is_identity AS [identity],
+          CONVERT(nvarchar(100),ic.seed_value) AS identitySeed,
+          CONVERT(nvarchar(100),ic.increment_value) AS identityIncrement,
+          ic.is_not_for_replication AS identityNotForReplication,
+          cc.definition AS computedDefinition, cc.is_persisted AS persisted,
+          dc.name AS defaultName, dc.definition AS defaultDefinition,
+          c.is_sparse AS sparse, c.is_rowguidcol AS [rowguidcol], c.is_filestream AS filestream,
+          c.generated_always_type AS generatedAlwaysType, c.encryption_type AS encryptionType,
+          c.xml_collection_id AS xmlCollectionId
+          FROM sys.columns c
+          JOIN sys.types t ON t.user_type_id=c.user_type_id
+          JOIN sys.schemas ts ON ts.schema_id=t.schema_id
+          LEFT JOIN sys.identity_columns ic ON ic.object_id=c.object_id AND ic.column_id=c.column_id
+          LEFT JOIN sys.computed_columns cc ON cc.object_id=c.object_id AND cc.column_id=c.column_id
+          LEFT JOIN sys.default_constraints dc ON dc.object_id=c.default_object_id
+          WHERE c.object_id IN (/*OBJECT_IDS*/) ORDER BY c.object_id,c.column_id`, ids),
+        diffMetadata(`SELECT i.object_id AS objectId, i.index_id AS indexId, i.name,
+          i.type_desc AS [type], i.is_unique AS [unique], i.is_primary_key AS primaryKey,
+          i.is_unique_constraint AS uniqueConstraint, i.is_disabled AS disabled,
+          i.has_filter AS hasFilter, i.filter_definition AS filterDefinition,
+          i.is_hypothetical AS hypothetical, ps.name AS partitionScheme,
+          kc.name AS constraintName, ic.key_ordinal AS keyOrdinal,
+          ic.is_included_column AS included, ic.is_descending_key AS descending,
+          c.name AS columnName
+          FROM sys.indexes i
+          LEFT JOIN sys.key_constraints kc ON kc.parent_object_id=i.object_id AND kc.unique_index_id=i.index_id
+          LEFT JOIN sys.partition_schemes ps ON ps.data_space_id=i.data_space_id
+          LEFT JOIN sys.index_columns ic ON ic.object_id=i.object_id AND ic.index_id=i.index_id
+          LEFT JOIN sys.columns c ON c.object_id=ic.object_id AND c.column_id=ic.column_id
+          WHERE i.object_id IN (/*OBJECT_IDS*/) AND i.index_id>0
+          ORDER BY i.object_id,i.index_id,ic.key_ordinal,ic.index_column_id`, ids),
+        diffMetadata(`SELECT parent_object_id AS objectId, name, definition,
+          is_disabled AS disabled, is_not_trusted AS notTrusted
+          FROM sys.check_constraints WHERE parent_object_id IN (/*OBJECT_IDS*/)`, ids),
+        diffMetadata(`SELECT fk.parent_object_id AS objectId, fk.referenced_object_id AS referencedObjectId,
+          fk.name, fk.delete_referential_action_desc AS deleteAction,
+          fk.update_referential_action_desc AS updateAction,
+          fk.is_disabled AS disabled, fk.is_not_trusted AS notTrusted,
+          rs.name AS referencedSchema, ro.name AS referencedTable,
+          fkc.constraint_column_id AS ordinal, pc.name AS columnName, rc.name AS referencedColumn
+          FROM sys.foreign_keys fk
+          JOIN sys.foreign_key_columns fkc ON fkc.constraint_object_id=fk.object_id
+          JOIN sys.columns pc ON pc.object_id=fk.parent_object_id AND pc.column_id=fkc.parent_column_id
+          JOIN sys.columns rc ON rc.object_id=fk.referenced_object_id AND rc.column_id=fkc.referenced_column_id
+          JOIN sys.objects ro ON ro.object_id=fk.referenced_object_id
+          JOIN sys.schemas rs ON rs.schema_id=ro.schema_id
+          WHERE fk.parent_object_id IN (/*OBJECT_IDS*/) OR fk.referenced_object_id IN (/*OBJECT_IDS*/)
+          ORDER BY fk.object_id,fkc.constraint_column_id`, ids),
+        diffMetadata(`SELECT v.object_id AS objectId, sm.definition,
+          CASE WHEN EXISTS(SELECT 1 FROM sys.indexes i WHERE i.object_id=v.object_id AND i.index_id>0) THEN 1 ELSE 0 END AS indexed
+          FROM sys.views v LEFT JOIN sys.sql_modules sm ON sm.object_id=v.object_id
+          WHERE v.object_id IN (/*OBJECT_IDS*/)`, ids),
+        diffMetadata(`SELECT t.object_id AS objectId,
+          t.temporal_type AS temporal, t.is_memory_optimized AS memoryOptimized,
+          t.is_filetable AS fileTable,
+          CASE WHEN EXISTS(SELECT 1 FROM sys.indexes i JOIN sys.partition_schemes ps ON ps.data_space_id=i.data_space_id WHERE i.object_id=t.object_id) THEN 1 ELSE 0 END AS partitioned,
+          CASE WHEN EXISTS(SELECT 1 FROM sys.partitions p WHERE p.object_id=t.object_id AND p.data_compression<>0) THEN 1 ELSE 0 END AS compressed,
+          CASE WHEN EXISTS(SELECT 1 FROM sys.triggers tr WHERE tr.parent_id=t.object_id AND tr.is_ms_shipped=0) THEN 1 ELSE 0 END AS hasTriggers
+          FROM sys.tables t WHERE t.object_id IN (/*OBJECT_IDS*/)`, ids),
+        diffMetadata(`SELECT d.referencing_id AS objectId,
+          d.referenced_database_name AS referencedDatabase,
+          d.referenced_server_name AS referencedServer,
+          COALESCE(rs.name,d.referenced_schema_name) AS referencedSchema,
+          COALESCE(ro.name,d.referenced_entity_name) AS referencedName,
+          CASE WHEN d.referenced_id IS NULL THEN 1 ELSE 0 END AS unresolved,
+          CASE WHEN ro.type='V' THEN 'view' WHEN ro.type='U' THEN 'table' ELSE NULL END AS referencedType
+          FROM sys.sql_expression_dependencies d
+          LEFT JOIN sys.objects ro ON ro.object_id=d.referenced_id
+          LEFT JOIN sys.schemas rs ON rs.schema_id=ro.schema_id
+          WHERE d.referencing_id IN (/*OBJECT_IDS*/)`, ids)
+      ]);
+      for (const column of columns) details[column.objectId]?.columns.push(column);
+      for (const row of indexes) {
+        const detail = details[row.objectId];
+        if (!detail) continue;
+        let index = detail.indexes.find(item => item.indexId === row.indexId);
+        if (!index) {
+          index = { indexId: row.indexId, name: row.name, type: row.type,
+            unique: Boolean(row.unique), primaryKey: Boolean(row.primaryKey),
+            constraintName: row.constraintName, disabled: Boolean(row.disabled),
+            partitioned: Boolean(row.partitionScheme), hasFilter: Boolean(row.hasFilter),
+            filterDefinition: row.filterDefinition, hypothetical: Boolean(row.hypothetical),
+            keys: [], includes: [] };
+          detail.indexes.push(index);
+        }
+        if (row.columnName && row.included) index.includes.push(row.columnName);
+        else if (row.columnName && row.keyOrdinal > 0) index.keys.push({ name: row.columnName, descending: Boolean(row.descending) });
+      }
+      for (const check of checks) details[check.objectId]?.checks.push(check);
+      const groupedFks = new Map();
+      for (const row of foreignKeys) {
+        let fk = groupedFks.get(row.name + ':' + row.objectId);
+        if (!fk) {
+          fk = { name: row.name, objectId: row.objectId, referencedObjectId: row.referencedObjectId,
+            referencedSchema: row.referencedSchema, referencedTable: row.referencedTable,
+            deleteAction: row.deleteAction, updateAction: row.updateAction,
+            disabled: Boolean(row.disabled), notTrusted: Boolean(row.notTrusted),
+            columns: [], referencedColumns: [] };
+          groupedFks.set(row.name + ':' + row.objectId, fk);
+        }
+        fk.columns.push(row.columnName);
+        fk.referencedColumns.push(row.referencedColumn);
+      }
+      for (const fk of groupedFks.values()) {
+        details[fk.objectId]?.foreignKeys.push(fk);
+        details[fk.referencedObjectId]?.incomingForeignKeys.push(fk);
+      }
+      for (const view of views) {
+        if (details[view.objectId]) {
+          details[view.objectId].definition = view.definition;
+          details[view.objectId].indexed = Boolean(view.indexed);
+        }
+      }
+      for (const table of tables) {
+        if (details[table.objectId]) details[table.objectId].properties = table;
+      }
+      for (const dependency of dependencies) details[dependency.objectId]?.dependencies?.push(dependency);
+      return details;
     },
     rows(schema, name, limit, offset, onReady = () => {}, cellBatch = null) {
       const request = new mssql.Request(pool);

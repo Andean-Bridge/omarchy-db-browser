@@ -13,6 +13,7 @@ Choose a connection, explore its schemas, open a table or view, inspect its defi
 - **Read individual values.** Select a cell, then double-click or press Enter to open a resizable, read-only viewer. Search and wrap text, format valid JSON, or inspect HTML as source. Right-click a cell to copy its full value or column name.
 - **Run SQL.** Work in multiple query tabs, use `Ctrl+Enter` to run a query, cancel a long-running query, and expand or resize the results area.
 - **Draft or fix SQL with AI.** When Omarchy's default agent is Codex and its CLI is installed and signed in, **✦ Ask AI** appears beside **Run query**. Describe the query you want or ask for a repair, then review the suggested SQL before choosing **Use in editor**. DB Studio uses the current tab's SQL and its last query error as context. It never runs the suggestion automatically.
+- **Compare SQL Server schemas.** Open **Schema diff**, choose source and target SQL Server or Azure SQL connections, then select the schemas, tables, and views to compare. Everything starts checked. Review the differences and generate a source-to-target `.sql` script to save or copy; DB Studio does not execute it.
 - **Keep results manageable.** Queries and table pages start at 100 rows. Set a default from 1 to 1,000 in **Settings**; DB Studio caps rows delivered for a query even when its `SELECT` has no `LIMIT` or `TOP`. This is a default result size, not a database work or affected-row limit.
 - **Move between databases.** On SQL Server and Azure SQL, click the current database in the sidebar to open a full-height picker. Search the list or enter a database name directly, then choose one to return to the schema browser. MySQL shows accessible databases in the schema tree. For PostgreSQL, connect to a specific database and browse its schemas.
 
@@ -42,6 +43,14 @@ Open a cell to read long text, formatted JSON, or HTML source. Search within the
 AI drafting sends your request, current SQL, last query error, database dialect, and relevant schema metadata to the selected Codex provider. DB Studio first sends a compact catalog of table and view names (up to 18,000 characters), then sends column names and types for at most eight relevant objects (up to 14,000 characters). The prompt excludes connection strings, passwords, row values, column defaults, and indexes. If the catalog is too large or the needed columns cannot be read, the assistant may ask for a more specific request rather than guessing.
 
 DB Studio checks the Omarchy default agent and `codex login status` when the panel opens. If Codex is absent or signed out, **Ask AI** stays hidden; database browsing and SQL queries still work. The AI action runs `codex exec` in noninteractive, ephemeral, read-only mode. Its draft replaces the open query tab only after you choose **Use in editor**; **Run query** remains a separate action.
+
+## SQL Server schema diff
+
+Select two different SQL Server or Azure SQL connection profiles, explicitly choosing the source and target. DB Studio reads object names from both databases, then reads detailed metadata only for checked source objects and their matching targets. Matching uses the same schema and object name; table column order and existing-table index differences are ignored. Target-only objects and columns are reported and left untouched.
+
+Results are grouped as **Missing in Target** and **Diff in Target**, with tables before views and names sorted alphabetically. Every difference starts checked. You can check a whole Tables or Views group, uncheck individual objects, and select a row to inspect its column or view definition differences and its proposed SQL. **Generate script** includes only checked differences. The target-only list is available separately for reference.
+
+The generated script creates missing schemas, ordinary tables with their defaults, keys, checks, foreign keys, and supported indexes, and missing views. For existing tables it adds columns and scripts simple type widening or nullability loosening; changed views receive `ALTER VIEW`. Changes that need a rebuild, could lose data, have blocking dependencies, or use unsupported table features are listed as manual work in an **incomplete** script. The script contains no `DROP` statements. DB Studio never executes it or copies row data. Review the saved `.sql` file and run it with a SQL Server script client against the named target database when ready.
 
 ## Local AI agent access
 

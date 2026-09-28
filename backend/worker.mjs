@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 import readline from 'node:readline';
 import { createReadStream } from 'node:fs';
+import { writeFile } from 'node:fs/promises';
+import path from 'node:path';
 import { ProfileStore } from './profiles.mjs';
 import { CellValueStore } from './cell-values.mjs';
 import { isLoopbackHost } from './connection-string.mjs';
@@ -8,6 +10,7 @@ import { boundedNumber, databaseName, identifier, openDatabase, openSwitchedData
 import { createLineWriter } from './protocol.mjs';
 import { SettingsStore, resultLimit } from './settings.mjs';
 import { aiAvailability, generateAiQuery } from './ai.mjs';
+import { compareCatalogs, compareDefinitions, generateSqlServerScript, objectKey, previewSchemaDiffChange, selectSchemaDiffChanges } from './schema-diff.mjs';
 
 if (Number(process.versions.node.split('.')[0]) < 20) {
   process.stderr.write('DB Studio requires Node.js 20 or newer.\n');
@@ -19,6 +22,7 @@ const settings = new SettingsStore();
 const connections = new Map();
 const running = new Map();
 const cellValues = new CellValueStore();
+const diffComparisons = new Map();
 const writeLine = createLineWriter();
 
 function respond(id, ok, value) {
@@ -36,7 +40,7 @@ function outputFailure() {
 
 function safeError(error) {
   const message = typeof error?.message === 'string' ? error.message : '';
-  const safe = /^(AI |Cell value |Connection |Invalid |Select |Enter |Put |Port |Password |The connection |The database |The SQL Server |The old |Saved connection |Secure keyring |Could not |SQL Server driver |PostgreSQL driver |MySQL driver |Query failed|Query cancelled|Query timed out|Unsupported |Limit |Offset |Timeout |Settings |Connection name|Host |Database |User |The previously saved)/;
+  const safe = /^(AI |Cell value |Connection |Invalid |Select |Choose |Generate |Schema diff |Enter |Put |Port |Password |The connection |The database |The SQL Server |The old |Saved connection |Secure keyring |Could not |SQL Server driver |PostgreSQL driver |MySQL driver |Query failed|Query cancelled|Query timed out|Unsupported |Limit |Offset |Timeout |Settings |Connection name|Host |Database |User |The previously saved)/;
   return safe.test(message) ? message : 'Operation failed. Check the connection and try again.';
 }
 
@@ -74,6 +78,27 @@ function schemaFor(connection, schema) {
     : connection.profile.type === 'postgres' ? 'public' : 'dbo';
 }
 
+async function withDiffConnections(sourceProfileId, targetProfileId, callback) {
+  if (!sourceProfileId || !targetProfileId || sourceProfileId === targetProfileId) {
+    throw new Error('Select two different SQL Server connections.');
+  }
+  let source;
+  let target;
+  try {
+    const sourceCredentials = await profiles.credentials(sourceProfileId);
+    const targetCredentials = await profiles.credentials(targetProfileId);
+    const supported = new Set(['sqlserver', 'azure_sql']);
+    if (!supported.has(sourceCredentials.profile.type) || !supported.has(targetCredentials.profile.type)) {
+      throw new Error('Schema diff supports SQL Server and Azure SQL connections.');
+    }
+    source = await openDatabase({ ...sourceCredentials.profile, id: sourceProfileId }, sourceCredentials.password);
+    target = await openDatabase({ ...targetCredentials.profile, id: targetProfileId }, targetCredentials.password);
+    return await callback({ source, target, sourceName: sourceCredentials.meta.name, targetName: targetCredentials.meta.name });
+  } finally {
+    await Promise.allSettled([source?.adapter?.close(), target?.adapter?.close()].filter(Boolean));
+  }
+}
+
 async function handle(id, action, payload) {
   switch (action) {
     case 'settings.get': return settings.get();
@@ -83,6 +108,65 @@ async function handle(id, action, payload) {
     case 'profiles.save': return profiles.save(payload);
     case 'profiles.duplicate': return profiles.duplicate(payload.profileId);
     case 'profiles.delete': return profiles.delete(payload.profileId);
+    case 'schemaDiff.catalog': return withDiffConnections(payload.sourceProfileId, payload.targetProfileId,
+      async ({ source, target, sourceName, targetName }) => {
+        const [sourceCatalog, targetCatalog] = await Promise.all([
+          source.adapter.diffCatalog(), target.adapter.diffCatalog()
+        ]);
+        const publicCatalog = (catalog, sourceSide) => ({ schemas: sourceSide
+          ? catalog.schemas.filter(schema => catalog.objects.some(object => object.schema === schema.name))
+          : catalog.schemas,
+          objects: catalog.objects.map(({ schema, name, type }) => ({ schema, name, type })) });
+        return { source: publicCatalog(sourceCatalog, true), target: publicCatalog(targetCatalog, false),
+          sourceName, targetName, sourceDatabase: source.profile.database, targetDatabase: target.profile.database };
+      });
+    case 'schemaDiff.compare': return withDiffConnections(payload.sourceProfileId, payload.targetProfileId,
+      async ({ source, target, sourceName, targetName }) => {
+        const [sourceCatalog, targetCatalog] = await Promise.all([
+          source.adapter.diffCatalog(), target.adapter.diffCatalog()
+        ]);
+        const selection = compareCatalogs(sourceCatalog, targetCatalog,
+          payload.selectedSchemas, payload.selectedObjects);
+        if (!selection.schemas.length) throw new Error('Select at least one schema to compare.');
+        const targetObjects = selection.selected.map(object => selection.targetMap.get(objectKey(object))).filter(Boolean);
+        const [sourceById, targetById] = await Promise.all([
+          source.adapter.diffDetails(selection.selected), target.adapter.diffDetails(targetObjects)
+        ]);
+        const keyed = (objects, details) => Object.fromEntries(objects.map(object => [objectKey(object), details[object.objectId]]));
+        const comparison = compareDefinitions({ sourceCatalog, targetCatalog,
+          sourceDetails: keyed(selection.selected, sourceById), targetDetails: keyed(targetObjects, targetById),
+          selectedSchemas: payload.selectedSchemas, selectedObjects: payload.selectedObjects });
+        diffComparisons.clear();
+        diffComparisons.set(comparison.id, { comparison, targetCatalog, sourceName, targetName,
+          sourceDatabase: source.profile.database, targetDatabase: target.profile.database, script: null });
+        return { comparisonId: comparison.id, selectedCount: comparison.selectedCount,
+          unchanged: comparison.unchanged, missingSchemas: comparison.missingSchemas,
+          targetOnly: comparison.targetOnly,
+          changes: comparison.changes.map(entry => ({ schema: entry.schema, name: entry.name,
+            type: entry.type, status: entry.status, notes: entry.notes, targetExists: !!entry.target,
+            columns: (entry.columns || []).map(({ name, action }) => ({ name, action })) })) };
+      });
+    case 'schemaDiff.preview': {
+      const saved = diffComparisons.get(payload.comparisonId);
+      if (!saved) throw new Error('Schema diff expired. Compare again.');
+      return previewSchemaDiffChange(saved.comparison, payload.objectKey, saved);
+    }
+    case 'schemaDiff.script': {
+      const saved = diffComparisons.get(payload.comparisonId);
+      if (!saved) throw new Error('Schema diff expired. Compare again.');
+      saved.script = generateSqlServerScript(selectSchemaDiffChanges(saved.comparison, payload.selectedKeys), saved);
+      return saved.script;
+    }
+    case 'schemaDiff.save': {
+      const saved = diffComparisons.get(payload.comparisonId);
+      if (!saved?.script) throw new Error('Generate the schema diff script before saving it.');
+      const filePath = payload.filePath;
+      if (typeof filePath !== 'string' || filePath.length > 2048 || !path.isAbsolute(filePath) ||
+          path.extname(filePath).toLowerCase() !== '.sql') throw new Error('Choose an absolute .sql file path.');
+      try { await writeFile(filePath, saved.script.sql, { mode: 0o600 }); }
+      catch { throw new Error('Could not save the schema diff script.'); }
+      return { saved: true };
+    }
     case 'connection.open':
     case 'agent.connection.open': {
       const agentRequest = action === 'agent.connection.open';
