@@ -168,7 +168,8 @@ const dialects = {
   azure_sql: 'Microsoft SQL Server / Azure SQL (T-SQL)',
   sqlserver: 'Microsoft SQL Server (T-SQL)',
   postgres: 'PostgreSQL',
-  mysql: 'MySQL'
+  mysql: 'MySQL',
+  cloudflare_d1: 'Cloudflare D1 (SQLite; main schema; no explicit SQL transactions)'
 };
 
 export async function generateAiQuery({ connection, instruction, sql = '', error = '', selected = null, signal,

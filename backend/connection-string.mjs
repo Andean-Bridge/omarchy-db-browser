@@ -1,6 +1,6 @@
 import { isIP } from 'node:net';
 
-const TYPES = new Set(['azure_sql', 'sqlserver', 'postgres', 'mysql']);
+const TYPES = new Set(['azure_sql', 'sqlserver', 'postgres', 'mysql', 'cloudflare_d1']);
 
 function booleanValue(value, fallback) {
   if (value === undefined || value === null || value === '') return fallback;
@@ -60,8 +60,8 @@ function urlOption(url, name) {
 
 export function normalizeType(type) {
   const value = String(type || '').toLowerCase().replace(/[-\s]/g, '_');
-  const normalized = ({postgresql: 'postgres', mssql: 'sqlserver', azure: 'azure_sql', sqlazure: 'azure_sql'})[value] || value;
-  if (!TYPES.has(normalized)) throw new Error('Select Azure SQL, SQL Server, PostgreSQL, or MySQL.');
+  const normalized = ({postgresql: 'postgres', mssql: 'sqlserver', azure: 'azure_sql', sqlazure: 'azure_sql', d1: 'cloudflare_d1'})[value] || value;
+  if (!TYPES.has(normalized)) throw new Error('Select Azure SQL, SQL Server, PostgreSQL, MySQL, or Cloudflare D1.');
   return normalized;
 }
 
@@ -181,6 +181,7 @@ function parseUrl(text, requestedType) {
 export function parseConnectionString(text, requestedType) {
   if (typeof text !== 'string' || !text.trim() || text.length > 8192) throw new Error('Enter a connection string.');
   const type = requestedType ? normalizeType(requestedType) : undefined;
+  if (type === 'cloudflare_d1') throw new Error('Enter the Cloudflare Account ID, Database ID, and API token in the connection fields.');
   if (/^(postgres(ql)?|mysql):\/\//i.test(text)) return parseUrl(text, type);
   if (type === 'mysql') return parseMysql(text);
   if (type === 'postgres') throw new Error('Use a postgres:// URL.');
@@ -190,6 +191,13 @@ export function parseConnectionString(text, requestedType) {
 export function normalizeProfile(input = {}) {
   if (!input || typeof input !== 'object' || Array.isArray(input)) throw new Error('Invalid connection profile.');
   const type = normalizeType(input.type);
+  if (type === 'cloudflare_d1') {
+    const accountId = requiredText(input.accountId, 'Cloudflare Account ID', 32);
+    const databaseId = requiredText(input.databaseId, 'Cloudflare Database ID', 36);
+    if (!/^[a-f0-9]{32}$/i.test(accountId)) throw new Error('Invalid Cloudflare Account ID: use the 32-character account identifier.');
+    if (!/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(databaseId)) throw new Error('Invalid Cloudflare Database ID: use the database UUID.');
+    return { name: requiredText(input.name, 'Connection name', 100), type, accountId, databaseId, database: databaseId };
+  }
   const host = requiredText(input.host, 'Host');
   const profile = {
     name: requiredText(input.name, 'Connection name', 100),

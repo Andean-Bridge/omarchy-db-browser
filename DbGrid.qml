@@ -3,6 +3,7 @@ import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
 import qs.Commons
+import qs.Commons as Theme
 
 // A bounded, virtualized result grid. Editing intentionally waits for v2.
 Item {
@@ -25,11 +26,11 @@ Item {
   signal copyCell(var cell)
   signal copyColumnName(string name)
 
-  readonly property color ink: Color.popups.text
+  readonly property color ink: Theme.Color.popups.text
   readonly property color mutedInk: Qt.rgba(ink.r, ink.g, ink.b, 0.58)
   readonly property color line: Qt.rgba(ink.r, ink.g, ink.b, 0.13)
   readonly property color stripe: Qt.rgba(ink.r, ink.g, ink.b, 0.025)
-  readonly property color surface: Qt.tint(Color.popups.background, Qt.rgba(ink.r, ink.g, ink.b, 0.035))
+  readonly property color surface: Qt.tint(Theme.Color.popups.background, Qt.rgba(ink.r, ink.g, ink.b, 0.035))
   readonly property int cellWidth: Math.max(160, Math.min(250, width / Math.max(1, columns.length)))
   readonly property int tableWidth: Math.max(width, columns.length * cellWidth)
   readonly property int firstVisibleColumn: Math.max(0, Math.floor(horizontal.contentX / cellWidth) - 1)
@@ -262,10 +263,10 @@ Item {
                   height: 39
                   clip: true
                   color: grid.selectedRow === rowDelegate.index && grid.selectedColumn === bodyCell.modelData
-                    ? Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.24)
+                    ? Qt.rgba(Theme.Color.accent.r, Theme.Color.accent.g, Theme.Color.accent.b, 0.24)
                     : rowDelegate.index % 2 === 0 ? "transparent" : grid.stripe
                   border.width: 1
-                  border.color: grid.selectedRow === rowDelegate.index && grid.selectedColumn === bodyCell.modelData ? Color.accent : grid.line
+                  border.color: grid.selectedRow === rowDelegate.index && grid.selectedColumn === bodyCell.modelData ? Theme.Color.accent : grid.line
                   Text {
                     id: cellTextItem
                     anchors.fill: parent
@@ -363,7 +364,7 @@ Item {
               radius: 8
               x: horizontalSlider.leftPadding + horizontalSlider.visualPosition * (horizontalSlider.availableWidth - width)
               y: horizontalSlider.topPadding + horizontalSlider.availableHeight / 2 - height / 2
-              color: horizontalSlider.pressed ? Color.accent : Qt.rgba(grid.ink.r, grid.ink.g, grid.ink.b, 0.78)
+              color: horizontalSlider.pressed ? Theme.Color.accent : Qt.rgba(grid.ink.r, grid.ink.g, grid.ink.b, 0.78)
             }
           }
           Button {
@@ -400,7 +401,7 @@ Item {
           visible: grid.error !== ""
           text: grid.error
           textFormat: Text.PlainText
-          color: Color.urgent
+          color: Theme.Color.urgent
           font.family: Style.font.family
           font.pixelSize: Math.max(14, Style.font.body)
         }

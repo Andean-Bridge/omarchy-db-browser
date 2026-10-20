@@ -6,6 +6,7 @@ import QtQuick.Layouts
 import Quickshell
 import Quickshell.Io
 import qs.Commons
+import qs.Commons as Theme
 
 Item {
   id: root
@@ -110,11 +111,11 @@ Item {
   property var diffManual: []
   property int diffGeneration: 0
 
-  readonly property color bg: Color.popups.background
-  readonly property color ink: Color.popups.text
+  readonly property color bg: Theme.Color.popups.background
+  readonly property color ink: Theme.Color.popups.text
   readonly property color softInk: Qt.rgba(ink.r, ink.g, ink.b, 0.62)
   readonly property color faintInk: Qt.rgba(ink.r, ink.g, ink.b, 0.42)
-  readonly property color accent: Color.accent
+  readonly property color accent: Theme.Color.accent
   readonly property color line: Qt.rgba(ink.r, ink.g, ink.b, 0.13)
   readonly property color surface: Qt.tint(bg, Qt.rgba(ink.r, ink.g, ink.b, 0.03))
   readonly property color raised: Qt.tint(bg, Qt.rgba(ink.r, ink.g, ink.b, 0.07))
@@ -126,7 +127,8 @@ Item {
     { label: "Azure SQL", value: "azure_sql", port: "1433" },
     { label: "SQL Server", value: "sqlserver", port: "1433" },
     { label: "PostgreSQL", value: "postgres", port: "5432" },
-    { label: "MySQL", value: "mysql", port: "3306" }
+    { label: "MySQL", value: "mysql", port: "3306" },
+    { label: "Cloudflare D1", value: "cloudflare_d1", port: "" }
   ]
 
   function engineName(type) {
@@ -871,8 +873,8 @@ Item {
       if (!currentTab || currentTab.pendingId !== requestId) return
       if (error) {
         var cancelled = /cancel/i.test(error)
-        updateTab(tabId, { busy: false, pendingId: 0, error: cancelled ? "" : error, message: cancelled ? "Query cancelled" : error })
-        if (cancelled) showNotice("Query cancelled", false)
+        updateTab(tabId, { busy: false, pendingId: 0, error: cancelled ? "" : error, message: cancelled ? (activeProfile && activeProfile.type === "cloudflare_d1" ? "Stopped waiting. Cloudflare may still finish the query." : "Query cancelled") : error })
+        if (cancelled) showNotice(activeProfile && activeProfile.type === "cloudflare_d1" ? "Stopped waiting. Cloudflare may still finish the query." : "Query cancelled", false)
         return
       }
       updateTab(tabId, { busy: false, pendingId: 0, columns: data.columns || [], rows: data.rows || [], cellRefs: data.cellRefs || [], rowCount: data.rowCount || 0, hasMore: !!data.hasMore, durationMs: data.durationMs || 0, message: data.message || "Query completed" })
@@ -962,7 +964,7 @@ Item {
   }
   function quoteName(name) {
     var type = activeProfile ? activeProfile.type : ""
-    if (type === "postgres") return '"' + String(name).replace(/"/g, '""') + '"'
+    if (type === "postgres" || type === "cloudflare_d1") return '"' + String(name).replace(/"/g, '""') + '"'
     if (type === "mysql") return '`' + String(name).replace(/`/g, '``') + '`'
     return '[' + String(name).replace(/\]/g, ']]') + ']'
   }
@@ -1015,7 +1017,7 @@ Item {
       if (!currentTab || currentTab.pendingRowsId !== requestId) return
       if (error) {
         updateTab(tabId, { busy: false, pendingRowsId: 0, error: /cancel/i.test(error) ? "" : error })
-        if (/cancel/i.test(error)) showNotice("Table load cancelled", false)
+        if (/cancel/i.test(error)) showNotice(activeProfile && activeProfile.type === "cloudflare_d1" ? "Stopped waiting. Cloudflare may still finish the table query." : "Table load cancelled", false)
         return
       }
       var pageOffset = Number.isInteger(data.offset) ? data.offset : offset
@@ -1070,12 +1072,14 @@ Item {
   }
   function saveConnection() {
     var name = connectionName.text.trim()
-    var raw = connectionStringInput.text.trim()
+    var isD1 = engineOptions[enginePicker.currentIndex].value === "cloudflare_d1"
+    var raw = isD1 ? "" : connectionStringInput.text.trim()
     if (!name) { formError.text = "Give this connection a name"; return }
     var hasStructured = !!(hostInput.text.trim() || databaseInput.text.trim() || userInput.text.trim() || passwordInput.text)
     var renameOnly = !!editingProfileId && !raw && !hasStructured
-    if (!raw && !renameOnly && !hostInput.text.trim()) { formError.text = "Enter a host or paste a connection string"; return }
-    if (!raw && !renameOnly && !databaseInput.text.trim()) { formError.text = "Enter a database name"; return }
+    if (!raw && !renameOnly && !hostInput.text.trim()) { formError.text = isD1 ? "Enter a Cloudflare Account ID" : "Enter a host or paste a connection string"; return }
+    if (!raw && !renameOnly && !databaseInput.text.trim()) { formError.text = isD1 ? "Enter a Cloudflare Database ID" : "Enter a database name"; return }
+    if (isD1 && !renameOnly && !passwordInput.text) { formError.text = "Enter a Cloudflare API token"; return }
     if (raw && passwordInput.text) { formError.text = "Use either a complete connection string or the password field"; return }
     var type = engineOptions[enginePicker.currentIndex].value
     var secret = passwordInput.text
@@ -1083,6 +1087,7 @@ Item {
       profile: { id: editingProfileId || undefined, name: name, type: type,
         host: hostInput.text.trim(), port: Number(portInput.text) || undefined,
         database: databaseInput.text.trim(), user: userInput.text.trim(),
+        accountId: isD1 ? hostInput.text.trim() : undefined, databaseId: isD1 ? databaseInput.text.trim() : undefined,
         ssl: sslCheck.checked, encrypt: type === "azure_sql" ? true : sslCheck.checked,
         trustServerCertificate: false },
       savePassword: rememberCheck.checked,
@@ -1375,6 +1380,7 @@ Item {
 
   FloatingWindow {
     id: window
+    objectName: "dbStudioWindow"
     title: "DB Studio"
     color: root.bg
     implicitWidth: 1420
@@ -1466,7 +1472,7 @@ Item {
                   StudioButton { label: "Choose"; compact: true; onClicked: connectionListDialog.open() }
                 }
               }
-              Text { Layout.fillWidth: true; visible: root.connectionId !== "" && !!root.activeProfile && root.activeProfile.transportSecure === false && !root.activeProfile.localConnection; text: "Unencrypted remote connection. Credentials and data may travel in plaintext."; textFormat: Text.PlainText; color: Color.urgent; font.family: root.uiFont; font.pixelSize: Math.max(12, Style.font.caption); wrapMode: Text.WordWrap }
+              Text { Layout.fillWidth: true; visible: root.connectionId !== "" && !!root.activeProfile && root.activeProfile.transportSecure === false && !root.activeProfile.localConnection; text: "Unencrypted remote connection. Credentials and data may travel in plaintext."; textFormat: Text.PlainText; color: Theme.Color.urgent; font.family: root.uiFont; font.pixelSize: Math.max(12, Style.font.caption); wrapMode: Text.WordWrap }
               Rectangle {
                 Layout.fillWidth: true
                 Layout.preferredHeight: 54
@@ -1556,7 +1562,7 @@ Item {
                   StudioButton { label: "Switch"; compact: true; buttonEnabled: databaseNameInput.text.trim() !== "" && !root.databaseSwitching; onClicked: root.switchDatabase(databaseNameInput.text) }
                 }
                 Text { Layout.fillWidth: true; visible: root.databaseListLimited; text: "Some databases may be hidden. Enter a name to switch directly."; color: root.softInk; font.family: root.uiFont; font.pixelSize: Math.max(12, Style.font.caption); wrapMode: Text.WordWrap }
-                Text { Layout.fillWidth: true; visible: root.databaseError !== ""; text: root.databaseError; textFormat: Text.PlainText; color: Color.urgent; font.family: root.uiFont; font.pixelSize: Math.max(12, Style.font.caption); wrapMode: Text.WordWrap }
+                Text { Layout.fillWidth: true; visible: root.databaseError !== ""; text: root.databaseError; textFormat: Text.PlainText; color: Theme.Color.urgent; font.family: root.uiFont; font.pixelSize: Math.max(12, Style.font.caption); wrapMode: Text.WordWrap }
               }
               RowLayout {
                 Layout.fillWidth: true
@@ -1576,7 +1582,7 @@ Item {
                 Layout.preferredHeight: root.schemaError ? Math.max(52, schemaErrorText.implicitHeight + 18) : 0
                 visible: !root.databasePickerExpanded && root.schemaError !== ""
                 radius: 5
-                color: Qt.rgba(Color.urgent.r, Color.urgent.g, Color.urgent.b, 0.12)
+                color: Qt.rgba(Theme.Color.urgent.r, Theme.Color.urgent.g, Theme.Color.urgent.b, 0.12)
                 RowLayout {
                   anchors.fill: parent
                   anchors.margins: 8
@@ -1586,7 +1592,7 @@ Item {
                     Layout.fillWidth: true
                     text: root.schemaError
                     textFormat: Text.PlainText
-                    color: Color.urgent
+                    color: Theme.Color.urgent
                     font.family: root.uiFont
                     font.pixelSize: Math.max(12, Style.font.caption)
                     wrapMode: Text.WordWrap
@@ -1861,7 +1867,7 @@ Item {
                       visible: root.resultPane === "messages"
                       text: root.activeTab ? (root.activeTab.message || "") : ""
                       textFormat: Text.PlainText
-                      color: root.activeTab && root.activeTab.error ? Color.urgent : root.ink
+                      color: root.activeTab && root.activeTab.error ? Theme.Color.urgent : root.ink
                       font.family: root.codeFont
                       font.pixelSize: Math.max(14, Style.font.body)
                       wrapMode: Text.WordWrap
@@ -2016,8 +2022,8 @@ Item {
           Layout.fillWidth: true
           Layout.preferredHeight: root.notice ? 30 : 0
           visible: root.notice !== ""
-          color: root.noticeError ? Qt.rgba(Color.urgent.r, Color.urgent.g, Color.urgent.b, 0.13) : root.surface
-          Text { anchors.fill: parent; anchors.leftMargin: 16; verticalAlignment: Text.AlignVCenter; text: root.notice; textFormat: Text.PlainText; color: root.noticeError ? Color.urgent : root.softInk; font.family: root.uiFont; font.pixelSize: Math.max(12, Style.font.caption); elide: Text.ElideRight }
+          color: root.noticeError ? Qt.rgba(Theme.Color.urgent.r, Theme.Color.urgent.g, Theme.Color.urgent.b, 0.13) : root.surface
+          Text { anchors.fill: parent; anchors.leftMargin: 16; verticalAlignment: Text.AlignVCenter; text: root.notice; textFormat: Text.PlainText; color: root.noticeError ? Theme.Color.urgent : root.softInk; font.family: root.uiFont; font.pixelSize: Math.max(12, Style.font.caption); elide: Text.ElideRight }
         }
       }
     }
@@ -2164,7 +2170,7 @@ Item {
             visible: root.aiExplanation !== "" || root.aiError !== ""
             text: root.aiError || root.aiExplanation
             textFormat: Text.PlainText
-            color: root.aiError ? Color.urgent : root.ink
+            color: root.aiError ? Theme.Color.urgent : root.ink
             font.family: root.uiFont
             font.pixelSize: Math.max(13, Style.font.bodySmall)
             wrapMode: Text.WordWrap
@@ -2523,7 +2529,7 @@ Item {
                           }
                           Text {
                             text: diffResultRow.modelData.kind === "group" ? root.diffIncludedCount(diffResultRow.modelData.groupKey) + "/" + diffResultRow.modelData.count : diffResultRow.modelData.kind === "section" ? String(diffResultRow.modelData.count) : diffResultRow.modelData.change.status === "manual" ? "review" : diffResultRow.modelData.change.status
-                            color: diffResultRow.objectRow && diffResultRow.modelData.change.status === "manual" ? Color.urgent : root.accent
+                            color: diffResultRow.objectRow && diffResultRow.modelData.change.status === "manual" ? Theme.Color.urgent : root.accent
                             font.family: root.uiFont
                             font.pixelSize: Math.max(11, Style.font.caption)
                           }
@@ -2554,7 +2560,7 @@ Item {
                       anchors.margins: 12
                       spacing: 8
                       Text { Layout.fillWidth: true; text: root.diffPreview ? root.diffPreview.schema + "." + root.diffPreview.name : root.diffPreviewBusy ? "Loading change…" : "Select an object to inspect"; textFormat: Text.PlainText; color: root.ink; font.family: root.codeFont; font.pixelSize: Math.max(15, Style.font.body); font.bold: true; elide: Text.ElideRight }
-                      Text { Layout.fillWidth: true; visible: !!root.diffPreview; text: root.diffPreview ? (root.diffPreview.status === "manual" ? "Different in target · manual review" : (root.diffPreview.status === "create" ? "Missing in target · CREATE " : "Different in target · ALTER ") + root.diffPreview.type.toUpperCase() + (root.diffPreview.complete ? "" : " · manual review needed")) : ""; color: root.diffPreview && !root.diffPreview.complete ? Color.urgent : root.softInk; font.family: root.uiFont; font.pixelSize: Math.max(12, Style.font.bodySmall); wrapMode: Text.WordWrap }
+                      Text { Layout.fillWidth: true; visible: !!root.diffPreview; text: root.diffPreview ? (root.diffPreview.status === "manual" ? "Different in target · manual review" : (root.diffPreview.status === "create" ? "Missing in target · CREATE " : "Different in target · ALTER ") + root.diffPreview.type.toUpperCase() + (root.diffPreview.complete ? "" : " · manual review needed")) : ""; color: root.diffPreview && !root.diffPreview.complete ? Theme.Color.urgent : root.softInk; font.family: root.uiFont; font.pixelSize: Math.max(12, Style.font.bodySmall); wrapMode: Text.WordWrap }
                       Text { Layout.fillWidth: true; visible: !!root.diffPreview && root.diffPreview.notes.length > 0; text: root.diffPreview ? root.diffPreview.notes.join(" ") : ""; color: root.softInk; font.family: root.uiFont; font.pixelSize: Math.max(12, Style.font.bodySmall); wrapMode: Text.WordWrap }
                       RowLayout {
                         Layout.fillWidth: true
@@ -2599,7 +2605,7 @@ Item {
               ColumnLayout {
                 anchors.fill: parent
                 spacing: 10
-                Text { Layout.fillWidth: true; text: root.diffScriptComplete ? "Script ready · no manual changes flagged" : "Script incomplete · " + root.diffManual.length + " changes need manual review"; color: root.diffScriptComplete ? root.ink : Color.urgent; font.family: root.uiFont; font.pixelSize: Math.max(14, Style.font.body); font.bold: true }
+                Text { Layout.fillWidth: true; text: root.diffScriptComplete ? "Script ready · no manual changes flagged" : "Script incomplete · " + root.diffManual.length + " changes need manual review"; color: root.diffScriptComplete ? root.ink : Theme.Color.urgent; font.family: root.uiFont; font.pixelSize: Math.max(14, Style.font.body); font.bold: true }
                 ScrollView {
                   Layout.fillWidth: true
                   Layout.fillHeight: true
@@ -2621,7 +2627,7 @@ Item {
               }
             }
           }
-          Text { Layout.fillWidth: true; visible: root.diffBusy || root.diffError !== ""; text: root.diffBusy ? "Reading schema metadata…" : root.diffError; textFormat: Text.PlainText; color: root.diffError ? Color.urgent : root.softInk; font.family: root.uiFont; font.pixelSize: Math.max(13, Style.font.bodySmall); wrapMode: Text.WordWrap }
+          Text { Layout.fillWidth: true; visible: root.diffBusy || root.diffError !== ""; text: root.diffBusy ? "Reading schema metadata…" : root.diffError; textFormat: Text.PlainText; color: root.diffError ? Theme.Color.urgent : root.softInk; font.family: root.uiFont; font.pixelSize: Math.max(13, Style.font.bodySmall); wrapMode: Text.WordWrap }
         }
       }
       footer: Rectangle {
@@ -2728,7 +2734,7 @@ Item {
             : root.viewerComplete ? ((root.viewedCell && root.viewedCell.byteLength !== null ? root.viewedCell.byteLength + " bytes · " : "") + "Full value")
             : "Preview only · full value unavailable"
           textFormat: Text.PlainText
-          color: root.viewerError ? Color.urgent : root.softInk
+          color: root.viewerError ? Theme.Color.urgent : root.softInk
           font.family: root.uiFont
           font.pixelSize: Math.max(12, Style.font.caption)
           elide: Text.ElideRight
@@ -2817,6 +2823,8 @@ Item {
 
     Dialog {
       id: connectionDialog
+      objectName: "connectionDialog"
+      readonly property bool isD1: enginePicker.currentIndex >= 0 && root.engineOptions[enginePicker.currentIndex].value === "cloudflare_d1"
       parent: window.contentItem
       modal: true
       title: root.editingProfileId ? "Edit connection" : "Add connection"
@@ -2857,7 +2865,7 @@ Item {
               anchors.leftMargin: 12
               anchors.rightMargin: 12
               text: root.editingHasStoredConnection
-                ? "Connection string saved in system keyring. Leave the string and fields blank to keep it, or enter new details to replace it."
+                ? connectionDialog.isD1 ? "Connection details saved in system keyring. Leave the fields blank to keep them, or enter new details to replace them." : "Connection string saved in system keyring. Leave the string and fields blank to keep it, or enter new details to replace it."
                 : "Connection details available for this session. Leave the string and fields blank to keep them, or enter new details to replace them."
               textFormat: Text.PlainText
               color: root.ink
@@ -2867,10 +2875,11 @@ Item {
             }
           }
           Text { text: "Name"; color: root.softInk; font.family: root.uiFont; font.pixelSize: Math.max(13, Style.font.bodySmall) }
-          StudioField { id: connectionName; Layout.fillWidth: true; placeholderText: "Production reporting" }
+          StudioField { id: connectionName; objectName: "connectionName"; Layout.fillWidth: true; placeholderText: "Production reporting" }
           Text { text: "Database type"; color: root.softInk; font.family: root.uiFont; font.pixelSize: Math.max(13, Style.font.bodySmall) }
           ComboBox {
             id: enginePicker
+            objectName: "enginePicker"
             Layout.fillWidth: true
             implicitHeight: 40
             model: root.engineOptions
@@ -2942,42 +2951,44 @@ Item {
               }
             }
           }
-          Text { text: root.editingProfileId ? "New connection string (optional)" : "Paste connection string (optional)"; color: root.softInk; font.family: root.uiFont; font.pixelSize: Math.max(13, Style.font.bodySmall); Layout.topMargin: 5 }
-          StudioField { id: connectionStringInput; Layout.fillWidth: true; placeholderText: root.editingProfileId ? "Blank keeps the existing connection" : "Paste a URL or driver connection string"; echoMode: TextInput.Password }
-          Text { Layout.fillWidth: true; text: "The full string is passed to the local worker, then cleared from this form. If remembered, it is stored in the system keyring."; color: root.softInk; font.family: root.uiFont; font.pixelSize: Math.max(12, Style.font.caption); wrapMode: Text.WordWrap }
-          Text { text: "OR ENTER FIELDS"; color: root.accent; font.family: root.uiFont; font.pixelSize: Math.max(12, Style.font.caption); font.bold: true; font.letterSpacing: 1.1; Layout.topMargin: 8 }
+          Text { visible: !connectionDialog.isD1; text: root.editingProfileId ? "New connection string (optional)" : "Paste connection string (optional)"; color: root.softInk; font.family: root.uiFont; font.pixelSize: Math.max(13, Style.font.bodySmall); Layout.topMargin: 5 }
+          StudioField { id: connectionStringInput; visible: !connectionDialog.isD1; Layout.fillWidth: true; placeholderText: root.editingProfileId ? "Blank keeps the existing connection" : "Paste a URL or driver connection string"; echoMode: TextInput.Password }
+          Text { Layout.fillWidth: true; visible: !connectionDialog.isD1; text: "The full string is passed to the local worker, then cleared from this form. If remembered, it is stored in the system keyring."; color: root.softInk; font.family: root.uiFont; font.pixelSize: Math.max(12, Style.font.caption); wrapMode: Text.WordWrap }
+          Text { visible: !connectionDialog.isD1; text: "OR ENTER FIELDS"; color: root.accent; font.family: root.uiFont; font.pixelSize: Math.max(12, Style.font.caption); font.bold: true; font.letterSpacing: 1.1; Layout.topMargin: 8 }
           RowLayout {
             Layout.fillWidth: true
             spacing: 10
-            ColumnLayout { Layout.fillWidth: true; Text { text: "Host"; color: root.softInk; font.pixelSize: Math.max(13, Style.font.bodySmall) } StudioField { id: hostInput; Layout.fillWidth: true; placeholderText: "server.example.com" } }
-            ColumnLayout { Layout.preferredWidth: 100; Text { text: "Port"; color: root.softInk; font.pixelSize: Math.max(13, Style.font.bodySmall) } StudioField { id: portInput; Layout.fillWidth: true; inputMethodHints: Qt.ImhDigitsOnly } }
+            ColumnLayout { Layout.fillWidth: true; Text { text: connectionDialog.isD1 ? "Cloudflare Account ID" : "Host"; color: root.softInk; font.pixelSize: Math.max(13, Style.font.bodySmall) } StudioField { id: hostInput; objectName: "hostInput"; Layout.fillWidth: true; placeholderText: connectionDialog.isD1 ? "32-character account identifier" : "server.example.com" } }
+            ColumnLayout { visible: !connectionDialog.isD1; Layout.preferredWidth: 100; Text { text: "Port"; color: root.softInk; font.pixelSize: Math.max(13, Style.font.bodySmall) } StudioField { id: portInput; Layout.fillWidth: true; inputMethodHints: Qt.ImhDigitsOnly } }
           }
-          Text { text: "Database"; color: root.softInk; font.family: root.uiFont; font.pixelSize: Math.max(13, Style.font.bodySmall) }
-          StudioField { id: databaseInput; Layout.fillWidth: true; placeholderText: "Database name" }
+          Text { text: connectionDialog.isD1 ? "D1 Database ID" : "Database"; color: root.softInk; font.family: root.uiFont; font.pixelSize: Math.max(13, Style.font.bodySmall) }
+          StudioField { id: databaseInput; objectName: "databaseInput"; Layout.fillWidth: true; placeholderText: connectionDialog.isD1 ? "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" : "Database name" }
           RowLayout {
             Layout.fillWidth: true
             spacing: 10
-            ColumnLayout { Layout.fillWidth: true; Text { text: "User"; color: root.softInk; font.pixelSize: Math.max(13, Style.font.bodySmall) } StudioField { id: userInput; Layout.fillWidth: true; placeholderText: "User name" } }
+            ColumnLayout { visible: !connectionDialog.isD1; Layout.fillWidth: true; Text { text: "User"; color: root.softInk; font.pixelSize: Math.max(13, Style.font.bodySmall) } StudioField { id: userInput; Layout.fillWidth: true; placeholderText: "User name" } }
             ColumnLayout {
               Layout.fillWidth: true
               Text {
-                text: enginePicker.currentIndex >= 0 && root.engineOptions[enginePicker.currentIndex].value === "mysql" ? "Password (optional)" : "Password"
+                text: connectionDialog.isD1 ? "Cloudflare API token" : enginePicker.currentIndex >= 0 && root.engineOptions[enginePicker.currentIndex].value === "mysql" ? "Password (optional)" : "Password"
                 color: root.softInk
                 font.pixelSize: Math.max(13, Style.font.bodySmall)
               }
               StudioField {
                 id: passwordInput
+                objectName: "passwordInput"
                 Layout.fillWidth: true
                 echoMode: TextInput.Password
-                placeholderText: enginePicker.currentIndex >= 0 && root.engineOptions[enginePicker.currentIndex].value === "mysql" ? "Leave blank if none" : "Password"
+                placeholderText: connectionDialog.isD1 ? "API token with D1 permission" : enginePicker.currentIndex >= 0 && root.engineOptions[enginePicker.currentIndex].value === "mysql" ? "Leave blank if none" : "Password"
               }
             }
           }
-          StudioCheck { id: sslCheck; text: "Use verified TLS"; checked: true; visible: connectionStringInput.text.trim() === ""; enabled: root.engineOptions[enginePicker.currentIndex].value !== "azure_sql" }
+          Text { Layout.fillWidth: true; visible: connectionDialog.isD1; text: "Find the IDs on your database's Cloudflare D1 page. Use an account-scoped API token with D1 Read to browse, or D1 Write for SQL changes. Add one connection per database. Connections always use verified HTTPS."; color: root.softInk; font.family: root.uiFont; font.pixelSize: Math.max(12, Style.font.caption); wrapMode: Text.WordWrap }
+          StudioCheck { id: sslCheck; text: "Use verified TLS"; checked: true; visible: !connectionDialog.isD1 && connectionStringInput.text.trim() === ""; enabled: root.engineOptions[enginePicker.currentIndex].value !== "azure_sql" }
           Text { Layout.fillWidth: true; visible: root.engineOptions[enginePicker.currentIndex].value === "azure_sql" && connectionStringInput.text.trim() === ""; text: "Azure SQL always uses verified TLS."; color: root.softInk; font.family: root.uiFont; font.pixelSize: Math.max(12, Style.font.caption); wrapMode: Text.WordWrap }
           Text {
             Layout.fillWidth: true
-            visible: connectionStringInput.text.trim() !== ""
+            visible: !connectionDialog.isD1 && connectionStringInput.text.trim() !== ""
             text: root.engineOptions[enginePicker.currentIndex].value === "postgres"
               ? "The URL controls TLS. Verified TLS is on unless sslmode=disable or ssl=false explicitly turns it off."
               : root.engineOptions[enginePicker.currentIndex].value === "mysql"
@@ -2991,7 +3002,7 @@ Item {
             font.pixelSize: Math.max(12, Style.font.caption)
             wrapMode: Text.WordWrap
           }
-          Text { Layout.fillWidth: true; visible: connectionStringInput.text.trim() === "" && !sslCheck.checked; text: "TLS is off. Credentials and data may travel in plaintext."; textFormat: Text.PlainText; color: Color.urgent; font.family: root.uiFont; font.pixelSize: Math.max(12, Style.font.caption); wrapMode: Text.WordWrap }
+          Text { Layout.fillWidth: true; visible: !connectionDialog.isD1 && connectionStringInput.text.trim() === "" && !sslCheck.checked; text: "TLS is off. Credentials and data may travel in plaintext."; textFormat: Text.PlainText; color: Theme.Color.urgent; font.family: root.uiFont; font.pixelSize: Math.max(12, Style.font.caption); wrapMode: Text.WordWrap }
           StudioCheck { id: rememberCheck; text: "Remember connection in system keyring"; checked: true }
           Text { Layout.fillWidth: true; text: "Without Remember, this connection works for this session and disappears when DB Studio closes."; color: root.softInk; font.family: root.uiFont; font.pixelSize: Math.max(12, Style.font.caption); wrapMode: Text.WordWrap }
           StudioCheck { id: agentAccessCheck; text: "Allow AI agents to use this connection"; checked: false; enabled: rememberCheck.checked }
@@ -3001,12 +3012,12 @@ Item {
               ? "DB Studio MCP and CLI agents can inspect this database and run SQL with this account's permissions, including changes. Results may go to your AI provider. DB Studio tool responses do not include credentials. An agent with shell access under your user account may still access local files or the keyring. Disabling this stops new DB Studio agent requests; queries already running may finish."
               : "Only remembered connections can be enabled for AI agents."
             textFormat: Text.PlainText
-            color: agentAccessCheck.checked && rememberCheck.checked ? Color.urgent : root.softInk
+            color: agentAccessCheck.checked && rememberCheck.checked ? Theme.Color.urgent : root.softInk
             font.family: root.uiFont
             font.pixelSize: Math.max(12, Style.font.caption)
             wrapMode: Text.WordWrap
           }
-          Text { id: formError; Layout.fillWidth: true; color: Color.urgent; font.family: root.uiFont; font.pixelSize: Math.max(13, Style.font.bodySmall); wrapMode: Text.WordWrap }
+          Text { id: formError; Layout.fillWidth: true; color: Theme.Color.urgent; font.family: root.uiFont; font.pixelSize: Math.max(13, Style.font.bodySmall); wrapMode: Text.WordWrap }
           RowLayout {
             Layout.fillWidth: true
             Layout.topMargin: 9

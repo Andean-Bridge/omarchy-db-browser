@@ -5,7 +5,7 @@
   "version": "0.1.0",
   "author": "Andean Bridge",
   "license": "MIT",
-  "description": "Browse SQL Server, Azure SQL, PostgreSQL, and MySQL databases from an Omarchy workspace",
+  "description": "Browse SQL Server, Azure SQL, PostgreSQL, MySQL, and Cloudflare D1 databases from an Omarchy workspace",
   "kinds": ["panel", "bar-widget"],
   "entryPoints": { "panel": "DbStudioPanel.qml", "barWidget": "BarWidget.qml" },
   "barWidget": {

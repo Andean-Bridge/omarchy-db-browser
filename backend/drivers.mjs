@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { cloudflareD1 } from './cloudflare-d1.mjs';
 
 const MAX_CELL_LENGTH = 4096;
 const MAX_RESULT_BYTES = 5 * 1024 * 1024;
@@ -824,6 +825,7 @@ export function queryError(error, sql = '', password = '') {
 
 export function tableReadError(error, type, operation, password = '') {
   const subject = operation === 'definition' ? 'table definition' : 'table data';
+  if (type === 'cloudflare_d1') return new Error(`Could not load ${subject}: ${queryError(error, '', password).message}`);
   if (type !== 'postgres') return new Error(`Could not load ${subject}.`);
 
   if (error?.code === '42501') {
@@ -842,10 +844,10 @@ export function tableReadError(error, type, operation, password = '') {
 
 export async function openDatabase(profile, password) {
   const driver = profile.type === 'azure_sql' || profile.type === 'sqlserver'
-    ? sqlserver : profile.type === 'postgres' ? postgres : profile.type === 'mysql' ? mysql : null;
+    ? sqlserver : profile.type === 'postgres' ? postgres : profile.type === 'mysql' ? mysql : profile.type === 'cloudflare_d1' ? cloudflareD1 : null;
   if (!driver) throw new Error('Unsupported database type.');
   const adapter = await driver(profile, password);
-  return { id: randomUUID(), profileId: profile.id, profile, adapter };
+  return { id: randomUUID(), profileId: profile.id, profile: adapter.databaseName ? { ...profile, database: adapter.databaseName } : profile, adapter };
 }
 
 export async function openSwitchedDatabase(connection, database, open = openDatabase) {

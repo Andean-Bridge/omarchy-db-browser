@@ -5,6 +5,7 @@ import { writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { ProfileStore } from './profiles.mjs';
 import { CellValueStore } from './cell-values.mjs';
+import { tableReadPlan } from './table-read.mjs';
 import { isLoopbackHost } from './connection-string.mjs';
 import { boundedNumber, databaseName, identifier, openDatabase, openSwitchedDatabase, tableReadError } from './drivers.mjs';
 import { createLineWriter } from './protocol.mjs';
@@ -57,7 +58,7 @@ function publicConnection(connection) {
     profile: {
       ...connection.meta,
       database: connection.profile.database,
-      transportSecure: type === 'postgres' || type === 'mysql' ? Boolean(ssl) : Boolean(encrypt),
+      transportSecure: type === 'cloudflare_d1' || (type === 'postgres' || type === 'mysql' ? Boolean(ssl) : Boolean(encrypt)),
       localConnection: isLoopbackHost(host)
     }
   };
@@ -75,7 +76,7 @@ function cancelConnectionTasks(connectionId) {
 function schemaFor(connection, schema) {
   if (schema) return identifier(schema, 'schema');
   return connection.profile.type === 'mysql' ? connection.profile.database
-    : connection.profile.type === 'postgres' ? 'public' : 'dbo';
+    : connection.profile.type === 'postgres' ? 'public' : connection.profile.type === 'cloudflare_d1' ? 'main' : 'dbo';
 }
 
 async function withDiffConnections(sourceProfileId, targetProfileId, callback) {
@@ -243,16 +244,22 @@ async function handle(id, action, payload) {
       running.set(id, task);
       try {
         const limit = resultLimit(payload.limit, (await settings.get()).defaultLimit);
+        let plan;
+        if (connection.profile.type === 'cloudflare_d1') {
+          const definition = await connection.adapter.describe(schema, name);
+          if (task.cancelRequested) throw new Error('Query cancelled.');
+          plan = tableReadPlan('cloudflare_d1', schema, name, definition, { limit, offset, sort: payload.sort, filter: payload.filter });
+        }
         const result = await connection.adapter.rows(schema, name, limit, offset, cancel => {
           task.cancel = cancel;
           if (task.cancelRequested) cancel();
-        }, cellBatch);
+        }, cellBatch, plan);
         if (task.cancelRequested) throw new Error('Query cancelled.');
         if (connections.get(connection.id) !== connection || !cellBatch.commit()) throw new Error('Connection is closed.');
-        return result;
+        return plan ? { ...result, order: plan.order, stableOrder: plan.stableOrder } : result;
       } catch (error) {
         if (task.cancelRequested) throw new Error('Query cancelled.');
-        if (error?.code === 'ROW_TOO_LARGE') throw error;
+        if (error?.code === 'ROW_TOO_LARGE' || (connection.profile.type === 'cloudflare_d1' && /^Invalid /.test(error?.message || ''))) throw error;
         throw tableReadError(error, connection.profile.type, 'data', connection.password);
       } finally {
         cellBatch.discard();

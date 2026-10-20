@@ -85,9 +85,12 @@ function definitionFromPayload(payload, type, name) {
     return payload.connectionString;
   }
   const input = payload.profile || {};
-  if (!input.host && !input.database && !input.user) return null;
+  if (!input.host && !input.database && !input.user && !input.accountId && !input.databaseId && !payload.password) return null;
   const profile = normalizeProfile({ ...input, name, type });
   if (payload.password !== undefined && typeof payload.password !== 'string') throw new Error('Password must be text.');
+  if (type === 'cloudflare_d1' && (typeof payload.password !== 'string' || !/^[\x21-\x7e]{1,4096}$/.test(payload.password))) {
+    throw new Error('Enter a Cloudflare API token without spaces or line breaks.');
+  }
   return CANONICAL_PREFIX + JSON.stringify({ profile, password: payload.password || '' });
 }
 
@@ -103,7 +106,7 @@ function parseDefinition(definition, meta, passwordOverride) {
   const profile = normalizeProfile({ ...parsed.profile, name: meta.name, type: meta.type });
   const password = passwordOverride !== undefined ? passwordOverride : parsed.password;
   if (typeof password !== 'string' || (!password && profile.type !== 'mysql')) {
-    throw new Error('Enter a password to connect.');
+    throw new Error(profile.type === 'cloudflare_d1' ? 'Enter a Cloudflare API token to connect.' : 'Enter a password to connect.');
   }
   return { profile, password };
 }
