@@ -9,7 +9,7 @@ test('native D1 connection form saves IDs and token, preserves saved credentials
   if (spawnSync('quickshell', ['--version']).error) return t.skip('Quickshell is required for native UI checks.');
   const directory = await mkdtemp(path.join(tmpdir(), 'db-studio-d1-ui-'));
   t.after(() => rm(directory, {recursive:true,force:true}));
-  for (const name of ['DbStudioPanel.qml','DbGrid.qml']) await copyFile(new URL(`../${name}`, import.meta.url), path.join(directory,name));
+  for (const name of ['ConnectionWorkspace.qml','DbGrid.qml']) await copyFile(new URL(`../${name}`, import.meta.url), path.join(directory,name));
   // Include the editor when testing a working tree with the newer workbench.
   for (const name of ['SqlEditor.qml', 'editor']) {
     await cp(new URL(`../${name}`, import.meta.url),path.join(directory,name),{recursive:true}).catch(error => { if (error.code !== 'ENOENT') throw error; });

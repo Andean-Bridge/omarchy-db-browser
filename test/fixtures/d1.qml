@@ -6,7 +6,7 @@ TestCase {
   id: suite
   name: "CloudflareD1"
   when: false
-  App.DbStudioPanel { id: panel }
+  App.ConnectionWorkspace { id: panel }
   function lastRequest() { return JSON.parse(panel.queuedRequests[panel.queuedRequests.length - 1]) }
   Timer {
     interval: 150; running: true

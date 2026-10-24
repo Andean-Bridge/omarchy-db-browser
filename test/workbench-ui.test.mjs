@@ -10,7 +10,7 @@ test('native workbench keeps query results visible, supports collapse, and prese
   if (spawnSync('quickshell', ['--version']).error) return t.skip('Quickshell is required for native UI checks.');
   const directory = await mkdtemp(path.join(tmpdir(), 'db-studio-workbench-ui-'));
   t.after(() => rm(directory, {recursive:true,force:true}));
-  for (const name of ['DbStudioPanel.qml','DbGrid.qml','SqlEditor.qml']) await copyFile(new URL(`../${name}`, import.meta.url), path.join(directory,name));
+  for (const name of ['ConnectionWorkspace.qml','DbGrid.qml','SqlEditor.qml']) await copyFile(new URL(`../${name}`, import.meta.url), path.join(directory,name));
   // Quickshell resolves qs.Commons relative to the shell configuration root.
   await cp(new URL('./qml/imports/qs/Commons',import.meta.url),path.join(directory,'Commons'),{recursive:true});
   await mkdir(path.join(directory,'editor'));

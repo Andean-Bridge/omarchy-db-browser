@@ -10,7 +10,7 @@ test('native schema diff supports mixed type selection, filtered bulk actions, a
   if (spawnSync('quickshell', ['--version']).error) return t.skip('Quickshell is required for native UI checks.');
   const directory = await mkdtemp(path.join(tmpdir(), 'db-studio-diff-ui-'));
   t.after(() => rm(directory, { recursive: true, force: true }));
-  for (const name of ['DbStudioPanel.qml', 'DbGrid.qml', 'SqlEditor.qml']) {
+  for (const name of ['ConnectionWorkspace.qml', 'DbGrid.qml', 'SqlEditor.qml']) {
     await copyFile(new URL(`../${name}`, import.meta.url), path.join(directory, name));
   }
   await cp(new URL('./qml/imports/qs/Commons',import.meta.url),path.join(directory,'Commons'),{recursive:true});

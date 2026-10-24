@@ -25,6 +25,7 @@ if (Number(process.versions.node.split('.')[0]) < 20) {
 const profiles = new ProfileStore();
 const settings = new SettingsStore();
 const connections = new Map();
+let shuttingDown = false;
 const running = new Map();
 const cellValues = new CellValueStore();
 const rowEdits = new RowEditStore();
@@ -188,6 +189,10 @@ async function handle(id, action, payload) {
       const { meta, profile, password } = await profiles.credentials(payload.profileId,
         { ...payload, requireAgentAccess: agentRequest });
       const opened = await openDatabase({ ...profile, id: meta.id }, password);
+      if (shuttingDown) {
+        await opened.adapter.close().catch(() => {});
+        throw new Error('Connection is closed.');
+      }
       const connection = { ...opened, password, meta };
       connections.set(connection.id, connection);
       return publicConnection(connection);
@@ -347,6 +352,7 @@ async function handle(id, action, payload) {
       }
       const limit = resultLimit(payload.limit, (await settings.get()).defaultLimit);
       const timeoutMs = boundedNumber(payload.timeoutMs, 30000, 1000, 1000000, 'Timeout');
+      if (connections.get(connection.id) !== connection) throw new Error('Connection is closed.');
       const task = { connectionId: connection.id, cancel: null, cancelRequested: false };
       const cellBatch = cellValues.begin(connection.id);
       running.set(id, task);
@@ -439,9 +445,12 @@ lines.on('line', line => {
 });
 
 async function shutdown() {
+  shuttingDown = true;
+  const opened = [...connections.values()];
+  connections.clear();
   for (const task of running.values()) task.cancel?.();
   cellValues.dispose();
   rowEdits.dispose();
-  await Promise.allSettled([...connections.values()].map(connection => connection.adapter.close()));
+  await Promise.allSettled(opened.map(connection => connection.adapter.close()));
 }
 lines.on('close', () => { void shutdown(); });

@@ -9,7 +9,7 @@ test('native browser filters object types together with search, counts, and empt
   if (spawnSync('quickshell', ['--version']).error) return t.skip('Quickshell is required for native UI checks.');
   const directory = await mkdtemp(path.join(tmpdir(), 'db-studio-object-filter-'));
   t.after(() => rm(directory, { recursive: true, force: true }));
-  for (const name of ['DbStudioPanel.qml', 'DbGrid.qml']) {
+  for (const name of ['ConnectionWorkspace.qml', 'DbGrid.qml']) {
     await copyFile(new URL(`../${name}`, import.meta.url), path.join(directory, name));
   }
   // Support both the current editor and the earlier workbench.

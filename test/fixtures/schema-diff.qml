@@ -19,7 +19,7 @@ TestCase {
   }
   width: 1000
   height: 800
-  DbStudioPanel { id: panel }
+  ConnectionWorkspace { id: panel }
   readonly property var objects: [{schema:"dbo",name:"customers",type:"table"}, {schema:"sales",name:"orders",type:"table"}, {schema:"sales",name:"open_orders",type:"view"}]
   function init() {
     panel.queuedRequests = []

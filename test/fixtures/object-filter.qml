@@ -6,7 +6,7 @@ TestCase {
   id: suite
   name: "ObjectFilter"
   when: false
-  App.DbStudioPanel { id: panel }
+  App.ConnectionWorkspace { id: panel }
   readonly property var catalog: ({
     dbo: [{schema:"dbo",name:"CompletedJobs",type:"table"}, {schema:"dbo",name:"JobSummary",type:"view"}],
     reports: [{schema:"reports",name:"DailyJobs",type:"view"}],

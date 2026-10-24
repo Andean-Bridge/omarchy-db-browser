@@ -1,0 +1,57 @@
+// Isolated native-UI fixture: no saved profiles, keyring, or database is accessed.
+import readline from 'node:readline';
+import { readFileSync, writeFileSync } from 'node:fs';
+const profiles = [{id:'staging',name:'Staging',type:'sqlserver',hasStoredConnection:false}, {id:'production',name:'Production',type:'sqlserver',hasStoredConnection:true}];
+const connections = new Map();
+const tasks = new Map();
+let nextConnection = 1;
+let settings={defaultLimit:100,reopenLastConnection:false,lastProfileId:null};
+try { settings=JSON.parse(readFileSync('fixture-settings.json','utf8')); } catch {}
+const send = (id,data,error) => process.stdout.write(JSON.stringify({id,ok:!error,...(error ? {error} : {data})})+'\n');
+const lines = readline.createInterface({input:process.stdin});
+lines.on('line', line => {
+  const {id,action,payload:p} = JSON.parse(line);
+  const connection = connections.get(p.connectionId);
+  if (action === 'profiles.list') return send(id,{profiles});
+  if (action === 'profiles.save') {
+    const index=profiles.findIndex(item=>item.id===p.profile.id);
+    profiles[index]={...profiles[index],name:p.profile.name,type:p.profile.type};
+    return send(id,{profile:profiles[index],credentialSaved:true});
+  }
+  if (action === 'settings.get') return send(id,settings);
+  if (action === 'settings.save') { Object.assign(settings,p); writeFileSync('fixture-settings.json',JSON.stringify(settings)); return send(id,settings); }
+  if (action === 'ai.status') return send(id,{available:false});
+  if (action === 'connection.open') {
+    const profile = profiles.find(item=>item.id===p.profileId);
+    const connectionId = `${profile.id}-${nextConnection++}`;
+    connections.set(connectionId,profile);
+    return send(id,{connectionId,profile:{...profile,database:'JobReporting',transportSecure:true}});
+  }
+  if (action === 'connection.close') { connections.delete(p.connectionId); return send(id,{closed:true}); }
+  if (action === 'query.cancel' || action === 'ai.cancel') {
+    const task=tasks.get(p.targetId);
+    if(task) { clearTimeout(task.timer); tasks.delete(p.targetId); send(p.targetId,null,'Query cancelled'); }
+    return send(id,{cancelled:!!task});
+  }
+  if (!connection) return send(id,null,'Connection is closed.');
+  if (action === 'schemas.list') return send(id,{schemas:[{name:'dbo'}]});
+  if (action === 'objects.list') return send(id,{objects:[{schema:'dbo',name:'Jobs',type:'table'},{schema:'dbo',name:'JobSummary',type:'view'}]});
+  if (action === 'databases.list') return send(id,{databases:[{name:'JobReporting'},{name:'OtherDatabase'}]});
+  if (action === 'connection.switchDatabase') {
+    const connectionId=`${connection.id}-${nextConnection++}`;
+    connections.set(connectionId,connection); connections.delete(p.connectionId);
+    return send(id,{connectionId,profile:{...connection,database:p.database,transportSecure:true}});
+  }
+  if (action === 'table.describe') return send(id,{columns:[{name:'id',type:'int',primaryKey:true}],indexes:[]});
+  if (action === 'table.rows') return send(id,{columns:[{name:'id',type:'int'}],rows:[[connection.id]],offset:p.offset,hasMore:false});
+  if (action === 'query.run' || action === 'ai.generate') {
+    const timer=setTimeout(()=>{
+      tasks.delete(id);
+      send(id,{columns:[{name:'connection'}],rows:[[p.connectionId]],rowCount:1,durationMs:12});
+    },action === 'ai.generate' || p.sql.includes('SLOW') ? 400 : 40);
+    tasks.set(id,{timer,connectionId:p.connectionId});
+    return;
+  }
+  send(id,{});
+});
+lines.on('close',()=>{for(const task of tasks.values()) clearTimeout(task.timer);});

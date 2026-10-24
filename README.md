@@ -2,7 +2,7 @@
 
 **Browse SQL Server, Azure SQL, PostgreSQL, MySQL, and Cloudflare D1 databases from an Omarchy workspace.**
 
-Choose a connection from the top bar, explore its schemas, open a table or view, inspect its definition, and run SQL without leaving your flow. The top bar shows the active connection name and a green status dot; click it to manage or add connections. The compact database selector sits at the top of the schema browser. Keep multiple connection profiles and switch between them when your work moves to another server or database. One connection is active at a time.
+Open connections in the top tab strip, then explore schemas, tables, and SQL inside each connection’s workspace. Keep Staging and Production open together, with separate query tabs, table tabs, results, and schema browser state. The active connection has a stronger indigo fill; query and result tabs remain darker.
 
 ![DB Studio browsing a MySQL schema and paged table data](preview.png)
 
@@ -22,6 +22,16 @@ Choose a connection from the top bar, explore its schemas, open a table or view,
 - **Compare SQL Server schemas.** Open **Schema diff**, choose source and target SQL Server or Azure SQL connections, then select the schemas, tables, and views to compare. Use Tables/Views group checkboxes, search, or select/clear the shown objects. Everything starts checked. Review the differences and generate a source-to-target `.sql` script to save or copy; DB Studio does not execute it.
 - **Keep results manageable.** Queries and table pages start at 100 rows. Set a default from 1 to 1,000 in **Settings**; DB Studio caps rows delivered for a query even when its `SELECT` has no `LIMIT` or `TOP`. This is a default result size, not a database work or affected-row limit.
 - **Move between databases.** On SQL Server and Azure SQL, click the current database in the sidebar to open a full-height picker. Search the list or enter a database name directly, then choose one to return to the schema browser. MySQL shows accessible databases in the schema tree. For PostgreSQL, connect to a specific database and browse its schemas.
+
+### Connection workspaces
+
+Choose **Connections** or **+** beside the connection tabs, then **Open tab** on a profile. Selecting a profile that is already open focuses its existing workspace. Right-click a connection tab and choose **New session** to open a separate connection using the same profile, or **Reconnect** to retry a disconnected session. Tab labels include the profile and database name, with a green dot for an open connection.
+
+Editing connection details opens a new session with those details while existing sessions keep their original database connection. Renaming a profile updates its open tab labels. Close a profile’s open tabs before removing it.
+
+Each connection keeps its own database selector, schema search and type filter, expanded schemas, query drafts, table tabs, results, and column widths. Switching connection tabs does not retarget existing queries. Queries and exports can finish in the background while another connection is visible; their output stays in the originating workspace. The database selector changes only its own connection, including the existing behavior of preserving SQL drafts while clearing old database results and table tabs.
+
+The **×** on a connection tab closes only that workspace and releases its database connection. Closing prompts for unsaved SQL, staged row edits, and running operations; **Review changes** returns to the affected workspace, **Cancel** keeps it open, and **Close and discard** closes it and cancels its operations. Saving SQL or a row must finish before closing. Closing the app checks every workspace, including inactive ones. Session-only profiles remain available to all workspaces until the app closes; they are never written to disk. The optional reopen setting restores the last active remembered profile, rather than every previously open tab.
 
 ### Work in smaller windows
 

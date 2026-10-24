@@ -6,7 +6,7 @@ TestCase {
   id: suite
   name: "Workbench"
   when: false
-  App.DbStudioPanel { id: panel }
+  App.ConnectionWorkspace { id: panel }
   readonly property var columns: [{name:"id",type:"integer",primaryKey:true}, {name:"name",type:"text",nullable:true}, {name:"amount",type:"numeric(20,4)",nullable:true}]
   Timer {
     interval: 150; running: true
