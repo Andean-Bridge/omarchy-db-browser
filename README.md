@@ -2,7 +2,7 @@
 
 **Browse SQL Server, Azure SQL, PostgreSQL, MySQL, and Cloudflare D1 databases from an Omarchy workspace.**
 
-Choose a connection, explore its schemas, open a table or view, inspect its definition, and run SQL without leaving your flow. Keep multiple connection profiles and switch between them when your work moves to another server or database. One connection is active at a time.
+Choose a connection from the top bar, explore its schemas, open a table or view, inspect its definition, and run SQL without leaving your flow. The top bar shows the active connection name and a green status dot; click it to manage or add connections. The compact database selector sits at the top of the schema browser. Keep multiple connection profiles and switch between them when your work moves to another server or database. One connection is active at a time.
 
 ![DB Studio browsing a MySQL schema and paged table data](preview.png)
 

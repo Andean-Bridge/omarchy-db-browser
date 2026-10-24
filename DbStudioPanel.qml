@@ -2031,7 +2031,34 @@ Item {
             Text { text: "DB Studio"; color: root.ink; font.family: root.uiFont; font.pixelSize: Math.max(22, Style.font.heading + 6); font.bold: true }
             Rectangle { Layout.preferredWidth: 1; Layout.preferredHeight: 28; color: root.line }
             StudioButton { label: root.sidebarVisible ? "Hide browser" : "Show browser"; compact: true; helpText: "Toggle schema browser (Ctrl+B)"; onClicked: root.sidebarVisible = !root.sidebarVisible }
-            StudioTab { label: "Connections"; onClicked: connectionListDialog.open() }
+            ToolButton {
+              id: connectionMenuButton
+              objectName: "connectionMenuButton"
+              readonly property bool connected: root.connectionId !== "" && !!root.activeProfile
+              text: connected ? root.activeProfile.name : root.connecting ? "Connecting…" : "Connections"
+              Layout.preferredWidth: Math.max(120, connectionMenuName.implicitWidth + 72)
+              Layout.maximumWidth: window.width < 1000 ? 180 : 240
+              Layout.minimumWidth: 100
+              Layout.preferredHeight: 46
+              Accessible.name: connected ? "Connections: " + text : text
+              ToolTip {
+                id: connectionMenuTip
+                visible: connectionMenuButton.hovered
+                text: connectionMenuButton.connected ? root.activeProfile.name + " · " + root.engineName(root.activeProfile.type)
+                  + (root.activeProfile.transportSecure === true ? " · Verified TLS" : root.activeProfile.transportSecure === false ? " · No TLS" : "")
+                  + "\nManage connections" : "Choose or add a connection"
+                contentItem: Text { text: connectionMenuTip.text; textFormat: Text.PlainText; color: root.ink; font.family: root.uiFont; font.pixelSize: Math.max(12, Style.font.caption) }
+                background: Rectangle { color: root.raised; border.color: root.line; border.width: 1; radius: 5 }
+              }
+              contentItem: RowLayout {
+                spacing: 9
+                Rectangle { objectName: "connectionStatusDot"; Layout.preferredWidth: 10; Layout.preferredHeight: 10; radius: 5; color: connectionMenuButton.connected ? "#58c89a" : root.connecting ? root.accent : root.faintInk }
+                Text { id: connectionMenuName; objectName: "connectionMenuName"; Layout.fillWidth: true; text: connectionMenuButton.text; textFormat: Text.PlainText; color: connectionMenuButton.connected ? root.ink : root.softInk; font.family: root.uiFont; font.pixelSize: Math.max(14, Style.font.body); font.bold: connectionMenuButton.connected; elide: Text.ElideRight }
+                Text { text: "⌄"; color: root.softInk; font.pixelSize: 16 }
+              }
+              background: Rectangle { color: connectionMenuButton.hovered ? root.raised : "transparent"; radius: 5; border.width: connectionMenuButton.activeFocus ? 2 : 0; border.color: root.accent }
+              onClicked: connectionListDialog.open()
+            }
             StudioTab { label: "Schema diff"; onClicked: root.openDiffDialog() }
             StudioTab { label: "Settings"; onClicked: settingsDialog.open() }
             Item { Layout.fillWidth: true }
@@ -2057,33 +2084,11 @@ Item {
               anchors.fill: parent
               anchors.margins: 18
               spacing: 15
-              Text { text: "CONNECTION"; color: root.accent; font.family: root.uiFont; font.pixelSize: Math.max(12, Style.font.caption); font.bold: true; font.letterSpacing: 1.1 }
-              Rectangle {
-                Layout.fillWidth: true
-                Layout.preferredHeight: 68
-                color: root.raised
-                radius: Style.cornerRadius > 0 ? Math.min(Style.cornerRadius, 7) : 5
-                border.width: 1
-                border.color: root.line
-                RowLayout {
-                  anchors.fill: parent
-                  anchors.leftMargin: 14
-                  anchors.rightMargin: 9
-                  spacing: 12
-                  Rectangle { Layout.preferredWidth: 11; Layout.preferredHeight: 11; radius: 6; color: root.connectionId ? "#58c89a" : root.faintInk }
-                  ColumnLayout {
-                    Layout.fillWidth: true
-                    spacing: 2
-                    Text { Layout.fillWidth: true; text: root.activeProfile ? root.activeProfile.name : "No connection"; textFormat: Text.PlainText; color: root.ink; font.family: root.uiFont; font.pixelSize: Math.max(15, Style.font.body); font.bold: true; elide: Text.ElideRight }
-                    Text { Layout.fillWidth: true; text: root.activeProfile ? root.engineName(root.activeProfile.type) + (root.activeProfile.transportSecure === true ? " · Verified TLS" : root.activeProfile.transportSecure === false ? " · No TLS" : "") : "Choose or add a database"; textFormat: Text.PlainText; color: root.softInk; font.family: root.uiFont; font.pixelSize: Math.max(13, Style.font.bodySmall); elide: Text.ElideRight }
-                  }
-                  StudioButton { label: "Choose"; compact: true; onClicked: connectionListDialog.open() }
-                }
-              }
               Text { Layout.fillWidth: true; visible: root.connectionId !== "" && !!root.activeProfile && root.activeProfile.transportSecure === false && !root.activeProfile.localConnection; text: "Unencrypted remote connection. Credentials and data may travel in plaintext."; textFormat: Text.PlainText; color: Theme.Color.urgent; font.family: root.uiFont; font.pixelSize: Math.max(12, Style.font.caption); wrapMode: Text.WordWrap }
               Rectangle {
+                objectName: "databaseSelector"
                 Layout.fillWidth: true
-                Layout.preferredHeight: 54
+                Layout.preferredHeight: 40
                 visible: root.connectionId !== "" && root.supportsDatabaseSwitch()
                 activeFocusOnTab: true
                 Accessible.role: Accessible.Button
@@ -2098,12 +2103,7 @@ Item {
                   anchors.rightMargin: 12
                   spacing: 10
                   StudioIcon { Layout.preferredWidth: 17; Layout.preferredHeight: 17; iconName: "server-database" }
-                  ColumnLayout {
-                    Layout.fillWidth: true
-                    spacing: 1
-                    Text { text: "DATABASE"; color: root.accent; font.family: root.uiFont; font.pixelSize: Math.max(11, Style.font.caption); font.bold: true; font.letterSpacing: 1.0 }
-                    Text { Layout.fillWidth: true; text: root.activeProfile ? root.activeProfile.database || "Select database" : "Select database"; textFormat: Text.PlainText; color: root.ink; font.family: root.uiFont; font.pixelSize: Math.max(14, Style.font.body); font.bold: true; elide: Text.ElideRight }
-                  }
+                  Text { Layout.fillWidth: true; text: root.activeProfile ? root.activeProfile.database || "Select database" : "Select database"; textFormat: Text.PlainText; color: root.ink; font.family: root.uiFont; font.pixelSize: Math.max(14, Style.font.body); font.bold: true; elide: Text.ElideRight }
                   Text { text: root.databasePickerExpanded ? "⌃" : "⌄"; color: root.softInk; font.family: root.uiFont; font.pixelSize: 20 }
                 }
                 HoverHandler { id: databasePickerHover }
@@ -2291,7 +2291,6 @@ Item {
                   topPadding: 12
                 }
               }
-              StudioButton { Layout.fillWidth: true; label: "Add connection"; iconName: "list-add"; onClicked: root.addConnection() }
             }
           }
 
@@ -4176,6 +4175,7 @@ Item {
 
     Dialog {
       id: connectionListDialog
+      objectName: "connectionListDialog"
       parent: window.contentItem
       modal: true
       title: "Connections"
@@ -4230,7 +4230,7 @@ Item {
         }
         RowLayout {
           Layout.fillWidth: true
-          StudioButton { label: "Add connection"; iconName: "list-add"; prominent: true; onClicked: { connectionListDialog.close(); root.addConnection() } }
+          StudioButton { objectName: "connectionMenuAddButton"; label: "Add connection"; iconName: "list-add"; prominent: true; onClicked: { connectionListDialog.close(); root.addConnection() } }
           Item { Layout.fillWidth: true }
           StudioButton { label: "Disconnect"; buttonEnabled: root.connectionId !== ""; onClicked: { root.disconnect(); connectionListDialog.close() } }
           StudioButton { label: "Close"; onClicked: connectionListDialog.close() }

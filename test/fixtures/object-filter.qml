@@ -35,8 +35,8 @@ TestCase {
     onTriggered: {
       try {
         const window = findChild(panel,"dbStudioWindow")
-        window.implicitWidth = 980
-        window.implicitHeight = 640
+        window.implicitWidth = 760
+        window.implicitHeight = 480
         window.visible = true
         if ("sidebarVisible" in panel) panel.sidebarVisible = true
         panel.connectionId = "fixture"
@@ -48,6 +48,44 @@ TestCase {
         const choice = findChild(panel,"objectTypeFilterButton")
         const menu = findChild(panel,"objectTypeMenu")
         const list = findChild(panel,"schemaBrowserArea").children[0]
+        const connectionButton = findChild(panel,"connectionMenuButton")
+        const connectionDialog = findChild(panel,"connectionListDialog")
+        const database = findChild(panel,"databaseSelector")
+        suite.compare(connectionButton.text,"Staging fixture")
+        suite.compare(findChild(panel,"connectionStatusDot").color,Qt.color("#58c89a"))
+        suite.compare(database.height,40)
+        suite.compare(database.y,0)
+        suite.mouseClick(connectionButton,connectionButton.width / 2,connectionButton.height / 2)
+        suite.wait(20)
+        suite.verify(connectionDialog.visible)
+        const addConnection = findChild(panel,"connectionMenuAddButton")
+        suite.verify(addConnection.visible)
+        suite.mouseClick(addConnection,addConnection.width / 2,addConnection.height / 2)
+        suite.wait(20)
+        suite.verify(!connectionDialog.visible)
+        suite.verify(findChild(panel,"connectionDialog").visible)
+        findChild(panel,"connectionDialog").close()
+        suite.wait(20)
+        panel.connectionId = ""
+        suite.compare(connectionButton.text,"Connections")
+        suite.verify(!database.visible)
+        suite.verify(findChild(panel,"connectionStatusDot").color !== Qt.color("#58c89a"))
+        panel.connecting = true
+        suite.compare(connectionButton.text,"Connecting…")
+        panel.connecting = false
+        panel.connectionId = "fixture"
+        panel.activeProfile = {name:"A very long <b>connection</b> name for staging",type:"sqlserver",database:"JobReporting"}
+        suite.wait(20)
+        suite.verify(connectionButton.width <= 180)
+        suite.compare(findChild(panel,"connectionMenuName").textFormat,Text.PlainText)
+        panel.activeProfile = {name:"Staging fixture",type:"sqlserver",database:"JobReporting"}
+        suite.mouseClick(database,database.width / 2,database.height / 2)
+        suite.wait(20)
+        suite.verify(panel.databasePickerExpanded)
+        suite.verify(!choice.visible)
+        suite.mouseClick(database,database.width / 2,database.height / 2)
+        suite.wait(20)
+        suite.verify(!panel.databasePickerExpanded)
         suite.verify(choice.visible)
         suite.compare(panel.objectTypeFilter,"all")
         // Keyboard access and dismissal leave the filter unchanged.
@@ -110,14 +148,17 @@ TestCase {
         suite.selectType(choice,0)
         suite.compare(panel.objectTypeFilter,"all")
         suite.compare(list.count,7)
-        // Keep the browser usable in a compact window with the sidebar shown.
+        // Keep the browser usable at the minimum window size with the sidebar shown.
         suite.wait(40)
-        suite.compare(window.width,980)
-        suite.compare(window.height,640)
+        suite.compare(window.width,760)
+        suite.compare(window.height,480)
         suite.verify(choice.visible && choice.width >= 28)
         suite.verify(list.height > 40)
         suite.selectType(choice,1)
         suite.compare(list.count,4)
+        panel.activeProfile = {name:"Staging fixture",type:"sqlserver",database:"JobReporting"}
+        suite.wait(20)
+        suite.grabImage(window.contentItem).save("browser-layout.png")
         suite.mouseClick(choice,choice.width / 2,choice.height / 2)
         suite.wait(20)
         suite.verify(menu.visible)
