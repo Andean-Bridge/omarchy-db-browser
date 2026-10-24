@@ -1,4 +1,5 @@
 import { appendRow, identifier, queryError } from './drivers.mjs';
+import { QueryResults } from './query-results.mjs';
 import { normalizeProfile } from './connection-string.mjs';
 import { tableReadPlan } from './table-read.mjs';
 
@@ -123,18 +124,51 @@ export async function cloudflareD1(input, token, { fetchApi = globalThis.fetch }
         primaryKey: column.pk > 0, generated: column.hidden > 1, default: column.dflt_value
       })), indexes };
     },
+    async createScript(schema, name) {
+      schemaName(schema);
+      const rows = await metadata(`SELECT type, sql FROM main.sqlite_schema
+        WHERE tbl_name = ? AND type IN ('table','index','trigger') AND sql IS NOT NULL
+        ORDER BY CASE type WHEN 'table' THEN 0 WHEN 'index' THEN 1 ELSE 2 END, name`, [name]);
+      if (!rows.some(row => row.type === 'table')) throw new Error('Could not read the CREATE TABLE definition.');
+      return rows.map(row => row.sql.trim().replace(/;?$/, ';')).join('\n\n');
+    },
     async rows(schema, name, limit, offset, onReady, cellBatch, readPlan) {
       schemaName(schema);
       const plan = readPlan || tableReadPlan('cloudflare_d1', 'main', name, null, { limit, offset });
       const [result] = await raw(plan.sql, plan.params, 30000, onReady);
       return { ...display(result, limit, cellBatch), offset };
     },
+    async exportRows(plan, onReady) {
+      // D1 returns a complete HTTP response instead of a row stream. Read small
+      // batches and bypass display(), which shortens values and caps grid bytes.
+      let offset = 0, batchSize = 250;
+      while (true) {
+        let result;
+        try {
+          [result] = await raw(plan.sql + ' LIMIT ? OFFSET ?', [...plan.params, batchSize, offset], plan.timeoutMs, onReady);
+        } catch (error) {
+          if (/response exceeds 32 MB/.test(error.message) && batchSize > 1) {
+            batchSize = Math.max(1, Math.floor(batchSize / 2));
+            continue;
+          }
+          throw error;
+        }
+        for (const row of result.results.rows) plan.exportRow(row);
+        offset += result.results.rows.length;
+        if (result.results.rows.length < batchSize) break;
+      }
+    },
     async run(sql, limit, timeoutMs, onReady, cellBatch) {
-      const results = await raw(sql, [], timeoutMs, onReady);
-      const result = results.find(result => result.results.columns.length) || results[0];
-      return { ...display(result, limit, cellBatch), ...(results.length > 1 ? {
-        message: `${results.length} SQL statements executed. Showing the first result set. All statements were sent to Cloudflare.`
-      } : {}) };
+      const statements = await raw(sql, [], timeoutMs, onReady);
+      const results = new QueryResults(limit, cellBatch);
+      for (const statement of statements) {
+        if (statement.results.columns.length) {
+          const set = results.begin(statement.results.columns.map(name => ({ name: String(name) })));
+          for (const row of statement.results.rows) results.row(set, row);
+        }
+        results.affectedRows += statement.meta?.changes || 0;
+      }
+      return results.finish(statements.length > 1 ? `${statements.length} SQL statements executed. All statements were sent to Cloudflare.` : '');
     }
   };
 }

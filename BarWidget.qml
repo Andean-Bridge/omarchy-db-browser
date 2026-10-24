@@ -50,7 +50,7 @@ BarWidget {
     }
     onPressed: function(mouseButton) {
       if (mouseButton === Qt.LeftButton && root.bar && root.bar.shell)
-        root.bar.shell.toggle(root.moduleName, "{}")
+        root.bar.shell.summon(root.moduleName, "{}")
     }
   }
 }

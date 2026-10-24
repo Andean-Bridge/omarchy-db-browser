@@ -95,8 +95,9 @@ export function compareDefinitions({ sourceCatalog, targetCatalog, sourceDetails
         }
       }
       for (const column of targetDetail.columns) {
-        if (!sourceColumns.has(column.name)) entry.columns.push({ name: column.name, action: 'target-only' });
+        if (!sourceColumns.has(column.name)) entry.columns.push({ name: column.name, action: 'target-only', target: column });
       }
+      if (entry.columns.some(change => change.action === 'target-only')) entry.notes.push('Target-only columns are left unchanged.');
       if (entry.columns.length > 0) entry.status = 'alter';
     }
     if (entry.status === 'same') unchanged++;
@@ -152,8 +153,11 @@ function tableUnsupported(table) {
   return issues;
 }
 
-function renderCreateTable(entry) {
-  const table = entry.source;
+function renderCreateTable(entry, options) {
+  const table = { ...entry.source,
+    indexes: entry.source.indexes.filter(index => index.constraintName || options.includeIndexes),
+    checks: options.includeChecks ? entry.source.checks : [],
+    foreignKeys: options.includeForeignKeys ? entry.source.foreignKeys : [] };
   const issues = tableUnsupported(table);
   if (issues.length) return { issues, statements: [], foreignKeys: [] };
   const fullName = `${sqlName(entry.schema)}.${sqlName(entry.name)}`;
@@ -166,6 +170,21 @@ function renderCreateTable(entry) {
   return { issues: [], statements, foreignKeys };
 }
 
+// Reuse the full table renderer for editor scripts, without diff headers or
+// target-database checks. Dependencies must already exist at the destination.
+export function sqlServerCreateScript(schema, name, definition) {
+  if (!definition?.columns?.length) throw new Error('Could not read the complete CREATE TABLE definition. Check metadata permissions.');
+  const result = renderCreateTable({schema, name, source: definition}, schemaDiffOptions());
+  if (result.issues.length) throw new Error('Could not generate complete CREATE: ' + result.issues.join(' '));
+  for (const {tableName, fk} of result.foreignKeys) {
+    let ddl = `ALTER TABLE ${tableName} WITH CHECK ADD CONSTRAINT ${sqlName(fk.name)} FOREIGN KEY (${fk.columns.map(sqlName).join(', ')}) REFERENCES ${sqlName(fk.referencedSchema)}.${sqlName(fk.referencedTable)} (${fk.referencedColumns.map(sqlName).join(', ')})`;
+    if (fk.deleteAction && fk.deleteAction !== 'NO_ACTION') ddl += ` ON DELETE ${fk.deleteAction.replaceAll('_', ' ')}`;
+    if (fk.updateAction && fk.updateAction !== 'NO_ACTION') ddl += ` ON UPDATE ${fk.updateAction.replaceAll('_', ' ')}`;
+    result.statements.push(ddl + ';\nGO');
+  }
+  return result.statements.join('\n\n');
+}
+
 function canAlterColumn(source, target, table) {
   if (source.computedDefinition || target.computedDefinition || source.identity || target.identity ||
       source.isUserDefined || target.isUserDefined || source.defaultDefinition !== target.defaultDefinition ||
@@ -174,6 +193,7 @@ function canAlterColumn(source, target, table) {
   if (table.foreignKeys?.some(fk => fk.columns.includes(source.name))) return false;
   if (table.incomingForeignKeys?.some(fk => fk.referencedColumns.includes(source.name))) return false;
   if (table.checks?.length) return false;
+  if (table.schemaBoundDependencies?.some(dep => !dep.columnName || dep.columnName === source.name)) return false;
   const sourceType = columnType(source);
   const targetType = columnType(target);
   if (!sourceType || !targetType || !renderColumn(source)) return false;
@@ -201,6 +221,8 @@ function renderAlterTable(entry) {
     } else if (canAlterColumn(source, change.target, entry.target)) {
       const type = columnType(source);
       statements.push(`ALTER TABLE ${fullName} ALTER COLUMN ${sqlName(source.name)} ${type}${source.collation ? ` COLLATE ${source.collation}` : ''} ${source.nullable ? 'NULL' : 'NOT NULL'};\nGO`);
+    } else if (entry.target.schemaBoundDependencies?.some(dep => !dep.columnName || dep.columnName === source.name)) {
+      issues.push(`Column ${source.name} has a schema-bound dependency; review that dependency before altering the column.`);
     } else issues.push(`Column ${source.name} needs manual review before it can be altered.`);
   }
   return { statements, issues };
@@ -213,6 +235,14 @@ function renderView(entry) {
   if (!match) return { issue: 'View definition could not be converted to CREATE or ALTER VIEW.' };
   const action = entry.status === 'create' ? 'CREATE' : 'ALTER';
   return { statement: `${action}${definition.slice(match[1].length)}\nGO` };
+}
+
+export function schemaDiffChangeReview(entry) {
+  if (entry.status === 'manual') return entry.notes;
+  if (entry.type === 'table') return (entry.status === 'create'
+    ? renderCreateTable(entry, schemaDiffOptions()) : renderAlterTable(entry)).issues;
+  const view = renderView(entry);
+  return view.issue ? [view.issue] : [];
 }
 
 export function selectSchemaDiffChanges(comparison, selectedKeys) {
@@ -272,12 +302,24 @@ export function previewSchemaDiffChange(comparison, key, options) {
     sql: script.sql, complete: script.complete, manual: script.manual };
 }
 
-export function generateSqlServerScript(comparison, { sourceName, targetName, sourceDatabase, targetDatabase, targetCatalog }) {
+export function schemaDiffOptions(input = {}) {
+  const defaults = { includeIndexes: true, includeChecks: true, includeForeignKeys: true, refreshDependentViews: true };
+  if (!input || typeof input !== 'object' || Array.isArray(input)) throw new Error('Invalid script options.');
+  for (const [key, value] of Object.entries(input)) {
+    if (!Object.hasOwn(defaults, key) || typeof value !== 'boolean') throw new Error('Invalid script options.');
+  }
+  return { ...defaults, ...input };
+}
+
+export function generateSqlServerScript(comparison, { sourceName, targetName, sourceDatabase, targetDatabase, targetCatalog, scriptOptions }) {
+  const options = schemaDiffOptions(scriptOptions);
+  const appliedObjects = new Set();
   const statements = [
     '-- DB Studio schema diff',
     `-- Source: ${commentText(sourceName)} (${commentText(sourceDatabase)})`,
     `-- Target: ${commentText(targetName)} (${commentText(targetDatabase)})`,
     '-- Review this script before running it. DB Studio has not executed any statements.',
+    ...Object.entries(options).filter(([, enabled]) => !enabled).map(([key]) => `-- Script option disabled: ${key}`),
     `IF DB_NAME() <> ${sqlString(targetDatabase)} THROW 51000, 'Wrong target database for DB Studio schema diff.', 1;`,
     'GO'
   ];
@@ -291,8 +333,9 @@ export function generateSqlServerScript(comparison, { sourceName, targetName, so
   for (const entry of tables) {
     const label = `${entry.schema}.${entry.name}`;
     if (entry.status === 'manual') { manual.push(`${label}: ${entry.notes.join(' ')}`); continue; }
-    const result = entry.status === 'create' ? renderCreateTable(entry) : renderAlterTable(entry);
+    const result = entry.status === 'create' ? renderCreateTable(entry, options) : renderAlterTable(entry);
     statements.push(...result.statements);
+    if (result.statements.length) appliedObjects.add(objectKey(entry));
     deferredFks.push(...(result.foreignKeys || []));
     for (const issue of result.issues) manual.push(`${label}: ${issue}`);
     for (const column of (entry.columns || []).filter(item => item.action === 'target-only')) {
@@ -300,7 +343,7 @@ export function generateSqlServerScript(comparison, { sourceName, targetName, so
     }
   }
   const availableTables = new Set(targetCatalog.objects.filter(object => object.type === 'table').map(objectKey));
-  for (const entry of tables.filter(item => item.status === 'create' && !tableUnsupported(item.source).length)) availableTables.add(objectKey(entry));
+  for (const entry of tables.filter(item => item.status === 'create' && appliedObjects.has(objectKey(item)))) availableTables.add(objectKey(entry));
   for (const { tableName, fk } of deferredFks) {
     if (!availableTables.has(JSON.stringify([fk.referencedSchema, fk.referencedTable]))) {
       manual.push(`${tableName}: foreign key ${fk.name} references a table absent from the target and this script.`);
@@ -314,8 +357,15 @@ export function generateSqlServerScript(comparison, { sourceName, targetName, so
     statements.push(`${ddl};\nGO`);
   }
   const availableObjects = new Set(targetCatalog.objects.map(objectKey));
-  for (const entry of tables.filter(item => item.status === 'create' && !tableUnsupported(item.source).length)) availableObjects.add(objectKey(entry));
-  const viewByKey = new Map(views.map(entry => [objectKey(entry), entry]));
+  for (const entry of tables.filter(item => item.status === 'create' && appliedObjects.has(objectKey(item)))) availableObjects.add(objectKey(entry));
+  // Use one dependency order for definition changes and existing target views.
+  // An unchanged SELECT * view may need refreshing before a selected view can
+  // refer to a newly added column through it.
+  const viewByKey = new Map(targetCatalog.objects.filter(object => object.type === 'view').map(view =>
+    [objectKey(view), { ...view, source: view, refreshOnly: true }]));
+  for (const view of views) viewByKey.set(objectKey(view), view);
+  const refreshedViews = [];
+  const affected = new Set(appliedObjects);
   const orderedViews = [];
   const visiting = new Set();
   const visited = new Set();
@@ -332,7 +382,7 @@ export function generateSqlServerScript(comparison, { sourceName, targetName, so
     visiting.add(key);
     stack.push(key);
     for (const dep of entry.source.dependencies || []) {
-      if (dep.referencedType !== 'view') continue;
+      if (dep.referencedDatabase || dep.referencedServer) continue;
       const dependency = viewByKey.get(JSON.stringify([dep.referencedSchema, dep.referencedName]));
       if (dependency) visitView(dependency);
     }
@@ -341,9 +391,25 @@ export function generateSqlServerScript(comparison, { sourceName, targetName, so
     visited.add(key);
     orderedViews.push(entry);
   }
-  views.forEach(visitView);
+  for (const view of viewByKey.values()) visitView(view);
   for (const entry of orderedViews) {
     const label = `${entry.schema}.${entry.name}`;
+    if (entry.refreshOnly) {
+      const dependsOnChange = (entry.source.dependencies || []).some(dep => !dep.referencedDatabase && !dep.referencedServer &&
+        affected.has(JSON.stringify([dep.referencedSchema, dep.referencedName])));
+      if (!dependsOnChange) continue;
+      affected.add(objectKey(entry));
+      if (entry.source.schemaBound) continue;
+      if (cycles.has(objectKey(entry))) {
+        manual.push(`${label}: circular target view dependency needs manual refresh.`);
+      } else if (!options.refreshDependentViews) {
+        manual.push(`${label}: dependent view metadata refresh was disabled; run sys.sp_refreshview after reviewing dependencies.`);
+      } else {
+        statements.push(`-- Refresh dependent target view; preserve its existing definition.\nEXEC sys.sp_refreshview @viewname = ${sqlString(`${sqlName(entry.schema)}.${sqlName(entry.name)}`)};\nGO`);
+        refreshedViews.push({ schema: entry.schema, name: entry.name });
+      }
+      continue;
+    }
     if (entry.status === 'manual') { manual.push(`${label}: ${entry.notes.join(' ')}`); continue; }
     if (cycles.has(objectKey(entry))) { manual.push(`${label}: circular view dependency needs manual ordering.`); continue; }
     const missingDependency = (entry.source.dependencies || []).find(dep =>
@@ -354,6 +420,8 @@ export function generateSqlServerScript(comparison, { sourceName, targetName, so
     if (result.issue) manual.push(`${label}: ${result.issue}`);
     else {
       statements.push(result.statement);
+      appliedObjects.add(objectKey(entry));
+      affected.add(objectKey(entry));
       availableObjects.add(objectKey(entry));
     }
   }
@@ -365,7 +433,7 @@ export function generateSqlServerScript(comparison, { sourceName, targetName, so
     statements.push('-- MANUAL CHANGES REQUIRED. This script is incomplete:');
     statements.push(...manual.map(issue => `-- ${commentText(issue)}`));
   }
-  return { sql: statements.filter(Boolean).join('\n\n') + '\n', complete: manual.length === 0, manual };
+  return { sql: statements.filter(Boolean).join('\n\n') + '\n', complete: manual.length === 0, manual, refreshedViews };
 }
 
 export { objectKey };

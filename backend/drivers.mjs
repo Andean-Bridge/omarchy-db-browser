@@ -1,5 +1,11 @@
 import { randomUUID } from 'node:crypto';
+import { commitSingleCell } from './row-edit.mjs';
+import { tableReadPlan } from './table-read.mjs';
 import { cloudflareD1 } from './cloudflare-d1.mjs';
+import { QueryResults } from './query-results.mjs';
+import { sqlServerBatches } from './sql-batches.mjs';
+import { postgresCreateScript } from './table-scripts.mjs';
+import { sqlServerCreateScript } from './schema-diff.mjs';
 
 const MAX_CELL_LENGTH = 4096;
 const MAX_RESULT_BYTES = 5 * 1024 * 1024;
@@ -73,6 +79,7 @@ export function appendRow(rows, raw, budget, cellRefs = [], cellBatch = null) {
   if (budget.bytes + bytes > MAX_RESULT_BYTES) return false;
   budget.bytes += bytes;
   rows.push(mapped);
+  cellBatch?.captureRow?.(raw);
   details.forEach((detail, columnIndex) => {
     if (!detail || typeof detail !== 'object' || !('preview' in detail)) return;
     const handle = detail.text !== undefined ? cellBatch?.capture(detail.text, detail.byteLength) ?? null : null;
@@ -104,7 +111,7 @@ async function sqlserver(profile, password) {
     password,
     options: { encrypt: profile.encrypt, trustServerCertificate: profile.trustServerCertificate },
     connectionTimeout: 15000,
-    requestTimeout: 120000,
+    requestTimeout: 1000000,
     pool: { max: 4, min: 0, idleTimeoutMillis: 30000 }
   });
   try { await pool.connect(); }
@@ -134,6 +141,18 @@ async function sqlserver(profile, password) {
   return {
     type: profile.type,
     close: () => pool.close(),
+    async updateCell(plan) {
+      const tx = new mssql.Transaction(pool);
+      return commitSingleCell({
+        begin: () => tx.begin(), commit: () => tx.commit(), rollback: () => tx.rollback(),
+        update: async ({ sql, params }) => {
+          const request = new mssql.Request(tx);
+          params.forEach((value, i) => request.input('p' + (i + 1), value));
+          const result = await request.query(sql + '; SELECT @@ROWCOUNT AS editedRows;');
+          return result.recordsets.at(-1)?.[0]?.editedRows;
+        }
+      }, plan);
+    },
     async databases() {
       // Azure SQL exposes the other databases only from master. A contained
       // database user may be unable to connect there, so retain the current
@@ -179,7 +198,7 @@ async function sqlserver(profile, password) {
     },
     async describe(schema, name) {
       const columns = await metadata(`SELECT c.name, t.name AS [type], c.is_nullable AS nullable,
-        dc.definition AS [default], c.max_length AS maxLength, c.precision, c.scale,
+        dc.definition AS [default], c.is_computed AS generated, c.is_identity AS [identity], c.max_length AS maxLength, c.precision, c.scale,
         CASE WHEN EXISTS (SELECT 1 FROM sys.indexes i JOIN sys.index_columns ic
           ON i.object_id=ic.object_id AND i.index_id=ic.index_id
           WHERE i.object_id=c.object_id AND i.is_primary_key=1 AND ic.column_id=c.column_id)
@@ -201,27 +220,48 @@ async function sqlserver(profile, password) {
       return {
         columns: columns.map(row => ({
           name: row.name, type: row.type, nullable: Boolean(row.nullable), default: row.default,
-          primaryKey: Boolean(row.primaryKey), maxLength: row.maxLength, precision: row.precision, scale: row.scale
+          primaryKey: Boolean(row.primaryKey), generated: Boolean(row.generated), identity: Boolean(row.identity), maxLength: row.maxLength, precision: row.precision, scale: row.scale
         })),
         indexes: groupIndexes(indexes)
       };
     },
+    async createScript(schema, name) {
+      const [object] = await metadata(`SELECT o.object_id AS objectId FROM sys.tables o
+        JOIN sys.schemas s ON s.schema_id=o.schema_id WHERE s.name=@schema AND o.name=@name`, {schema, name});
+      if (!object) throw new Error('Could not find the table. Refresh the schema.');
+      const details = await this.diffDetails([object]);
+      return sqlServerCreateScript(schema, name, details[object.objectId]);
+    },
     async diffCatalog() {
-      const [schemas, objects] = await Promise.all([
+      const [schemas, objects, viewDependencies] = await Promise.all([
         metadata("SELECT TOP (2001) name FROM sys.schemas WHERE name NOT IN ('sys','INFORMATION_SCHEMA') ORDER BY name", {}, 30000),
         metadata(`SELECT TOP (10001) o.object_id AS objectId, s.name AS [schema], o.name,
-          CASE WHEN o.type='V' THEN 'view' ELSE 'table' END AS [type]
+          CASE WHEN o.type='V' THEN 'view' ELSE 'table' END AS [type],
+          CONVERT(bit, OBJECTPROPERTYEX(o.object_id, 'IsSchemaBound')) AS schemaBound
           FROM sys.objects o JOIN sys.schemas s ON s.schema_id=o.schema_id
           WHERE o.type IN ('U','V') AND s.name NOT IN ('sys','INFORMATION_SCHEMA')
-          ORDER BY s.name,o.name`, {}, 30000)
+          ORDER BY s.name,o.name`, {}, 30000),
+        metadata(`SELECT TOP (50001) d.referencing_id AS objectId,
+          d.referenced_database_name AS referencedDatabase, d.referenced_server_name AS referencedServer,
+          COALESCE(s.name,d.referenced_schema_name) AS referencedSchema,
+          COALESCE(o.name,d.referenced_entity_name) AS referencedName
+          FROM sys.sql_expression_dependencies d JOIN sys.views v ON v.object_id=d.referencing_id
+          LEFT JOIN sys.objects o ON o.object_id=d.referenced_id
+          LEFT JOIN sys.schemas s ON s.schema_id=o.schema_id`, {}, 30000)
       ]);
       if (schemas.length > 2000 || objects.length > 10000) throw new Error('Could not compare schemas: database catalog exceeds the comparison limit.');
+      if (viewDependencies.length > 50000) throw new Error('Could not compare schemas: view dependency catalog exceeds the comparison limit.');
+      const byId = new Map(objects.map(object => [object.objectId, object]));
+      for (const dep of viewDependencies) {
+        const view = byId.get(dep.objectId);
+        if (view) (view.dependencies ||= []).push(dep);
+      }
       return { schemas: schemas.map(row => ({ name: row.name })), objects };
     },
     async diffDetails(objects) {
       const ids = objects.map(object => object.objectId);
       const details = Object.fromEntries(ids.map(id => [id, {
-        columns: [], indexes: [], checks: [], foreignKeys: [], incomingForeignKeys: [], dependencies: [],
+        columns: [], indexes: [], checks: [], foreignKeys: [], incomingForeignKeys: [], dependencies: [], schemaBoundDependencies: [],
         definition: null, indexed: false, properties: {}
       }]));
       if (!ids.length) return details;
@@ -288,7 +328,9 @@ async function sqlserver(profile, password) {
           CASE WHEN EXISTS(SELECT 1 FROM sys.partitions p WHERE p.object_id=t.object_id AND p.data_compression<>0) THEN 1 ELSE 0 END AS compressed,
           CASE WHEN EXISTS(SELECT 1 FROM sys.triggers tr WHERE tr.parent_id=t.object_id AND tr.is_ms_shipped=0) THEN 1 ELSE 0 END AS hasTriggers
           FROM sys.tables t WHERE t.object_id IN (/*OBJECT_IDS*/)`, ids),
-        diffMetadata(`SELECT d.referencing_id AS objectId,
+        diffMetadata(`SELECT d.referencing_id AS objectId, d.referenced_id AS referencedObjectId,
+          d.is_schema_bound_reference AS schemaBound,
+          COL_NAME(d.referenced_id,d.referenced_minor_id) AS columnName,
           d.referenced_database_name AS referencedDatabase,
           d.referenced_server_name AS referencedServer,
           COALESCE(rs.name,d.referenced_schema_name) AS referencedSchema,
@@ -298,7 +340,7 @@ async function sqlserver(profile, password) {
           FROM sys.sql_expression_dependencies d
           LEFT JOIN sys.objects ro ON ro.object_id=d.referenced_id
           LEFT JOIN sys.schemas rs ON rs.schema_id=ro.schema_id
-          WHERE d.referencing_id IN (/*OBJECT_IDS*/)`, ids)
+          WHERE d.referencing_id IN (/*OBJECT_IDS*/) OR (d.referenced_id IN (/*OBJECT_IDS*/) AND d.is_schema_bound_reference=1)`, ids)
       ]);
       for (const column of columns) details[column.objectId]?.columns.push(column);
       for (const row of indexes) {
@@ -345,15 +387,18 @@ async function sqlserver(profile, password) {
       for (const table of tables) {
         if (details[table.objectId]) details[table.objectId].properties = table;
       }
-      for (const dependency of dependencies) details[dependency.objectId]?.dependencies?.push(dependency);
+      for (const dependency of dependencies) {
+        details[dependency.objectId]?.dependencies?.push(dependency);
+        if (dependency.schemaBound) details[dependency.referencedObjectId]?.schemaBoundDependencies?.push(dependency);
+      }
       return details;
     },
-    rows(schema, name, limit, offset, onReady = () => {}, cellBatch = null) {
+    rows(schema, name, limit, offset, onReady = () => {}, cellBatch = null, readPlan = null) {
       const request = new mssql.Request(pool);
       request.stream = true;
       request.arrayRowMode = true;
-      request.input('offset', offset);
-      request.input('count', limit + 1);
+      const plan = readPlan || tableReadPlan(profile.type, schema, name, null, { limit, offset });
+      plan.params.forEach((value, index) => request.input('p' + (index + 1), value));
       const rows = [];
       const cellRefs = [];
       const budget = { bytes: 0 };
@@ -361,6 +406,7 @@ async function sqlserver(profile, password) {
       let hasMore = false;
       let internalCancel = false;
       let oversizedRow = false;
+      let exportFailure;
       let userCancel = false;
       let timedOut = false;
       const cancel = () => { userCancel = true; try { request.cancel(); } catch {} };
@@ -375,6 +421,7 @@ async function sqlserver(profile, password) {
           clearTimeout(timer);
           if (userCancel) reject(new Error('Query cancelled.'));
           else if (timedOut) reject(new Error('Query timed out.'));
+          else if (exportFailure) reject(exportFailure);
           else if (oversizedRow) reject(oversizedRowError());
           else if (error && !internalCancel) reject(error);
           else resolve({ columns, rows, cellRefs, limit, offset, hasMore });
@@ -384,6 +431,11 @@ async function sqlserver(profile, password) {
         });
         request.on('row', row => {
           if (internalCancel || userCancel || timedOut) return;
+          if (plan.exportRow) {
+            try { plan.exportRow(row); }
+            catch (error) { exportFailure = error; internalCancel = true; stop(); }
+            return;
+          }
           if (rows.length < limit) {
             if (appendRow(rows, row, budget, cellRefs, cellBatch)) return;
             if (rows.length === 0) oversizedRow = true;
@@ -395,62 +447,67 @@ async function sqlserver(profile, password) {
         request.on('error', done);
         request.on('done', () => done());
         if (userCancel) { done(new Error('Query cancelled.')); return; }
-        timer = setTimeout(() => { timedOut = true; stop(); }, 15000);
+        timer = setTimeout(() => { timedOut = true; stop(); }, plan.timeoutMs || 15000);
         try {
-          request.query(`SELECT * FROM ${sqlIdentifier(schema)}.${sqlIdentifier(name)} ORDER BY (SELECT NULL) OFFSET @offset ROWS FETCH NEXT @count ROWS ONLY`).catch(done);
+          request.query(plan.sql).catch(done);
         } catch (error) { done(error); }
       });
     },
-    run(sql, limit, timeoutMs, onReady, cellBatch = null) {
-      const request = new mssql.Request(pool);
-      request.stream = true;
-      request.arrayRowMode = true;
-      const rows = [];
-      const cellRefs = [];
-      const budget = { bytes: 0 };
-      let columns = [];
-      let recordsets = 0;
-      let rowCount = 0;
-      let hasMore = false;
-      let internalCancel = false;
-      let userCancel = false;
-      let timedOut = false;
-      const cancel = () => { userCancel = true; request.cancel(); };
-      onReady(cancel);
-      return new Promise((resolve, reject) => {
-        let settled = false;
-        let timer;
-        const done = (error, result) => {
-          if (settled) return;
-          settled = true;
-          clearTimeout(timer);
-          if (userCancel) reject(new Error('Query cancelled.'));
-          else if (timedOut) reject(new Error('Query timed out.'));
-          else if (error && !(internalCancel && error.code === 'ECANCEL')) reject(queryError(error, sql, password));
-          else resolve({ columns, rows, cellRefs, rowCount: result?.rowsAffected?.reduce((a, b) => a + b, 0) ?? rowCount, hasMore });
-        };
-        request.on('recordset', meta => {
-          recordsets += 1;
-          if (recordsets === 1) columns = meta.map(item => column(item.name, item.type?.name));
-        });
-        request.on('row', row => {
-          // A batch or stored procedure may return more than one result set.
-          // Stop on the next set too, so later SELECTs cannot stream unbounded rows.
-          if (recordsets !== 1) {
-            if (!hasMore) { hasMore = true; internalCancel = true; request.cancel(); }
-            return;
+    async run(sql, limit, timeoutMs, onReady, cellBatch = null) {
+      const batches = sqlServerBatches(sql);
+      const results = new QueryResults(limit, cellBatch);
+      let activeRequest, reservedConnection;
+      let userCancel = false, timedOut = false;
+      const stop = () => { try { activeRequest?.cancel(); } catch {} };
+      onReady(() => { userCancel = true; stop(); });
+      const timer = setTimeout(() => { timedOut = true; stop(); }, timeoutMs);
+      try {
+        // GO batches need the same session for temporary tables and SET options,
+        // without wrapping the user's script in an implicit transaction.
+        let parent = pool;
+        if (batches.length > 1) {
+          reservedConnection = await pool.acquire();
+          parent = Object.create(pool);
+          parent.acquire = (_request, callback) => callback(null, reservedConnection, pool.config);
+          parent.release = () => {};
+        }
+        for (const batch of batches) {
+          if (userCancel || timedOut) break;
+          const request = activeRequest = new mssql.Request(parent);
+          request.stream = true;
+          request.arrayRowMode = true;
+          let current, firstError, seenRows = 0;
+          request.on('recordset', meta => {
+            current = results.begin(meta.map(item => column(item.name, item.type?.name)));
+          });
+          request.on('row', row => {
+            seenRows++;
+            if (!userCancel && !timedOut) results.row(current, row);
+          });
+          // Streaming can report more than one error. Wait for request completion
+          // before releasing the reserved session or starting the next GO batch.
+          request.on('error', error => { firstError ||= error; });
+          let value;
+          try { value = await (batches.length > 1 ? request.batch(batch.sql) : request.query(batch.sql)); }
+          catch (error) { firstError ||= error; }
+          activeRequest = null;
+          if (firstError) {
+            if (Number.isInteger(firstError.lineNumber)) firstError.lineNumber += batch.line - 1;
+            throw firstError;
           }
-          rowCount += 1;
-          if (rows.length < limit && appendRow(rows, row, budget, cellRefs, cellBatch)) return;
-          if (!hasMore) { hasMore = true; internalCancel = true; request.cancel(); }
-        });
-        request.on('error', error => done(error));
-        request.on('done', result => done(null, result));
-        if (userCancel) { done(new Error('Query cancelled.')); return; }
-        timer = setTimeout(() => { timedOut = true; request.cancel(); }, timeoutMs);
-        try { request.query(sql).catch(error => done(error)); }
-        catch (error) { done(error); }
-      });
+          results.affectedRows += Math.max(0, (value?.rowsAffected || []).reduce((a, b) => a + b, 0) - seenRows);
+        }
+        if (userCancel) throw new Error('Query cancelled.');
+        if (timedOut) throw new Error('Query timed out.');
+        return results.finish();
+      } catch (error) {
+        if (userCancel) throw new Error('Query cancelled.');
+        if (timedOut) throw new Error('Query timed out.');
+        throw queryError(error, sql, password);
+      } finally {
+        clearTimeout(timer);
+        if (reservedConnection) pool.release(reservedConnection);
+      }
     }
   };
 }
@@ -494,6 +551,18 @@ async function postgres(profile, password) {
   return {
     type: profile.type,
     close: () => Promise.allSettled([pool.end(), cancelPool.end()]),
+    async updateCell(plan) {
+      const client = await pool.connect();
+      try {
+        return await commitSingleCell({
+          begin: () => client.query('BEGIN'), commit: () => client.query('COMMIT'), rollback: () => client.query('ROLLBACK'),
+          update: async ({ sql, params }) => {
+            await client.query('SET LOCAL statement_timeout = 15000');
+            return (await client.query(sql, params)).rowCount;
+          }
+        }, plan);
+      } finally { client.release(); }
+    },
     async schemas() {
       return metadata("SELECT nspname AS name FROM pg_namespace WHERE nspname NOT LIKE 'pg_%' AND nspname <> 'information_schema' ORDER BY nspname LIMIT 2000");
     },
@@ -509,6 +578,7 @@ async function postgres(profile, password) {
       const columns = await metadata(`SELECT a.attname AS name,
         pg_catalog.format_type(a.atttypid,a.atttypmod) AS type,
         NOT a.attnotnull AS nullable,
+        (a.attgenerated <> '') AS generated, (a.attidentity <> '') AS identity,
         pg_catalog.pg_get_expr(d.adbin,d.adrelid) AS "default",
         EXISTS (SELECT 1 FROM pg_catalog.pg_constraint p
           WHERE p.conrelid=c.oid AND p.contype='p' AND a.attnum=ANY(p.conkey)) AS "primaryKey"
@@ -522,7 +592,9 @@ async function postgres(profile, password) {
         FROM pg_indexes WHERE schemaname=$1 AND tablename=$2 ORDER BY indexname`, [schema, name]);
       return { columns, indexes };
     },
-    async rows(schema, name, limit, offset, onReady = () => {}, cellBatch = null) {
+    createScript: (schema, name) => postgresCreateScript(metadata, schema, name),
+    async rows(schema, name, limit, offset, onReady = () => {}, cellBatch = null, readPlan = null) {
+      const plan = readPlan || tableReadPlan(profile.type, schema, name, null, { limit, offset });
       const client = await pool.connect();
       const rows = [];
       const cellRefs = [];
@@ -531,6 +603,7 @@ async function postgres(profile, password) {
       let hasMore = false;
       let internalCancel = false;
       let oversizedRow = false;
+      let exportFailure;
       let userCancel = false;
       let timedOut = false;
       let started = false;
@@ -549,16 +622,24 @@ async function postgres(profile, password) {
       try {
         onReady(() => { userCancel = true; cancel(); });
         if (userCancel) throw new Error('Query cancelled.');
+        if (plan.exportRow) await client.query(`SET statement_timeout TO ${plan.timeoutMs || 15000}`);
+        if (userCancel) throw new Error('Query cancelled.');
         const query = new pg.Query({
-          text: `SELECT * FROM ${pgIdentifier(schema)}.${pgIdentifier(name)} LIMIT $1 OFFSET $2`,
-          values: [limit + 1, offset], rowMode: 'array'
+          text: plan.sql,
+          values: plan.params, rowMode: 'array',
+          ...(plan.exportRow ? { types: { getTypeParser: () => value => value } } : {})
         });
         const result = await new Promise((resolve, reject) => {
-          const timer = setTimeout(() => { timedOut = true; cancel(); }, 15000);
+          const timer = setTimeout(() => { timedOut = true; cancel(); }, plan.timeoutMs || 15000);
           const finish = (callback, value) => { clearTimeout(timer); callback(value); };
           query.on('row', (row, meta) => {
             if (!columns.length && meta?.fields) columns = meta.fields.map(field => column(field.name, String(field.dataTypeID)));
             if (internalCancel || userCancel || timedOut) return;
+            if (plan.exportRow) {
+              try { plan.exportRow(row); }
+              catch (error) { exportFailure = error; internalCancel = true; cancel(); }
+              return;
+            }
             if (rows.length < limit) {
               if (appendRow(rows, row, budget, cellRefs, cellBatch)) return;
               if (rows.length === 0) oversizedRow = true;
@@ -576,29 +657,29 @@ async function postgres(profile, password) {
         if (!columns.length) columns = result.fields.map(field => column(field.name, String(field.dataTypeID)));
         if (userCancel) throw new Error('Query cancelled.');
         if (timedOut) throw new Error('Query timed out.');
+        if (exportFailure) throw exportFailure;
         if (oversizedRow) throw oversizedRowError();
         reusable = !internalCancel;
         return { columns, rows, cellRefs, limit, offset, hasMore };
       } catch (error) {
         if (userCancel) throw new Error('Query cancelled.');
         if (timedOut) throw new Error('Query timed out.');
+        if (exportFailure) throw exportFailure;
         if (oversizedRow) throw oversizedRowError();
         if (internalCancel) return { columns, rows, cellRefs, limit, offset, hasMore };
         throw error;
       } finally {
         clearTimeout(hardStopTimer);
+        if (reusable && plan.exportRow) {
+          try { await client.query('SET statement_timeout TO 15000'); } catch { reusable = false; }
+        }
         client.release(!reusable);
       }
     },
     async run(sql, limit, timeoutMs, onReady, cellBatch = null) {
       const client = await pool.connect();
-      const rows = [];
-      const cellRefs = [];
-      const budget = { bytes: 0 };
-      let columns = [];
-      let rowCount = 0;
-      let hasMore = false;
-      let internalCancel = false;
+      const results = new QueryResults(limit, cellBatch);
+      const byMeta = new Map();
       let userCancel = false;
       let cancelSent = false;
       const cancel = async () => {
@@ -607,35 +688,37 @@ async function postgres(profile, password) {
         try { await cancelPool.query('SELECT pg_cancel_backend($1)', [client.processID]); }
         catch { client.connection?.stream?.destroy(); }
       };
+      const display = meta => {
+        if (!byMeta.has(meta)) byMeta.set(meta, results.begin(meta.fields.map(field => column(field.name, String(field.dataTypeID)))));
+        return byMeta.get(meta);
+      };
       try {
         await client.query(`SET statement_timeout TO ${timeoutMs}`);
         onReady(() => { userCancel = true; void cancel(); });
         if (userCancel) throw new Error('Query cancelled.');
         const query = new pg.Query({ text: sql, rowMode: 'array' });
-        let firstResult;
         const result = await new Promise((resolve, reject) => {
-          query.on('row', (row, resultMeta) => {
-            if (!firstResult) firstResult = resultMeta;
-            if (resultMeta !== firstResult) {
-              if (!hasMore) { hasMore = true; internalCancel = true; void cancel(); }
-              return;
-            }
-            if (!columns.length && resultMeta?.fields) columns = resultMeta.fields.map(field => column(field.name, String(field.dataTypeID)));
-            rowCount += 1;
-            if (rows.length < limit && appendRow(rows, row, budget, cellRefs, cellBatch)) return;
-            if (!hasMore) { hasMore = true; internalCancel = true; void cancel(); }
-          });
+          query.on('row', (row, meta) => { if (!userCancel) results.row(display(meta), row); });
           query.on('error', reject);
           query.on('end', resolve);
           client.query(query);
         });
-        const displayResult = firstResult || (Array.isArray(result) ? result.find(item => item.fields?.length) || result[0] : result);
-        if (!columns.length) columns = displayResult?.fields?.map(field => column(field.name, String(field.dataTypeID))) || [];
         if (userCancel) throw new Error('Query cancelled.');
-        return { columns, rows, cellRefs, rowCount: displayResult?.rowCount ?? rowCount, hasMore };
+        // Empty SELECTs have fields but no row event. Rebuild in statement order
+        // from the completion metadata so they get their own correctly placed tab.
+        const completed = Array.isArray(result) ? result : [result];
+        const withColumns = completed.filter(meta => meta?.fields?.length);
+        results.resultSets = [];
+        for (const meta of withColumns.slice(0, 100)) {
+          const set = byMeta.get(meta);
+          if (set) results.resultSets.push(set);
+          else results.begin(meta.fields.map(field => column(field.name, String(field.dataTypeID))));
+        }
+        results.omittedSets = Math.max(0, withColumns.length - 100);
+        for (const meta of completed) if (!meta?.fields?.length) results.affectedRows += meta?.rowCount || 0;
+        return results.finish();
       } catch (error) {
         if (userCancel) throw new Error('Query cancelled.');
-        if (internalCancel && error.code === '57014') return { columns, rows, cellRefs, rowCount, hasMore };
         throw queryError(error, sql, password);
       } finally {
         client.release(true);
@@ -651,7 +734,7 @@ async function mysql(profile, password) {
   const connectionConfig = {
     host: profile.host, port: profile.port, database: profile.database,
     user: profile.user, password, ssl: profile.ssl ? { rejectUnauthorized: true, verifyIdentity: true } : undefined,
-    connectTimeout: 15000, multipleStatements: false,
+    connectTimeout: 15000, multipleStatements: true,
     supportBigNumbers: true, bigNumberStrings: true
   };
   const pool = mysql2.createPool({ ...connectionConfig, connectionLimit: 4 });
@@ -669,6 +752,17 @@ async function mysql(profile, password) {
   return {
     type: profile.type,
     close: () => Promise.allSettled([promisePool.end(), promiseCancelPool.end()]),
+    async updateCell(plan, schema, name) {
+      const tables = await metadata('SELECT ENGINE FROM information_schema.TABLES WHERE TABLE_SCHEMA=? AND TABLE_NAME=? AND TABLE_TYPE=\'BASE TABLE\'', [schema, name]);
+      if (tables[0]?.ENGINE?.toLowerCase() !== 'innodb') throw new Error('Row editing requires an InnoDB table. Use SQL for this table.');
+      const client = await promisePool.getConnection();
+      try {
+        return await commitSingleCell({
+          begin: () => client.beginTransaction(), commit: () => client.commit(), rollback: () => client.rollback(),
+          update: async ({ sql, params }) => (await client.execute({ sql, values: params, timeout: 15000 }))[0].affectedRows
+        }, plan);
+      } finally { client.release(); }
+    },
     async schemas() {
       return metadata('SELECT SCHEMA_NAME AS name FROM information_schema.SCHEMATA ORDER BY SCHEMA_NAME LIMIT 2000');
     },
@@ -691,7 +785,15 @@ async function mysql(profile, password) {
         ORDER BY INDEX_NAME,SEQ_IN_INDEX`, [schema, name]);
       return { columns: columns.map(row => ({ ...row, nullable: Boolean(row.nullable), primaryKey: Boolean(row.primaryKey) })), indexes: groupIndexes(indexes) };
     },
-    rows(schema, name, limit, offset, onReady = () => {}, cellBatch = null) {
+    async createScript(schema, name) {
+      const [row] = await metadata(`SHOW CREATE TABLE ${myIdentifier(schema)}.${myIdentifier(name)}`);
+      const ddl = row?.['Create Table'];
+      if (!ddl || !/^CREATE TABLE\s+(?:`(?:``|[^`])+`|\S+)(?=\s*\()/i.test(ddl)) throw new Error('Could not read the complete CREATE TABLE definition.');
+      return ddl.replace(/^CREATE TABLE\s+(?:`(?:``|[^`])+`|\S+)(?=\s*\()/i,
+        () => `CREATE TABLE ${myIdentifier(schema)}.${myIdentifier(name)}`).replace(/;?$/, ';');
+    },
+    rows(schema, name, limit, offset, onReady = () => {}, cellBatch = null, readPlan = null) {
+      const plan = readPlan || tableReadPlan(profile.type, schema, name, null, { limit, offset });
       return new Promise((resolve, reject) => {
         pool.getConnection((connectionError, connection) => {
           if (connectionError) { reject(connectionError); return; }
@@ -702,6 +804,7 @@ async function mysql(profile, password) {
           let hasMore = false;
           let internalCancel = false;
           let oversizedRow = false;
+          let exportFailure;
           let userCancel = false;
           let queryStarted = false;
           let settled = false;
@@ -720,6 +823,7 @@ async function mysql(profile, password) {
             clearTimeout(hardStopTimer);
             connection.destroy();
             if (userCancel) reject(new Error('Query cancelled.'));
+            else if (exportFailure) reject(exportFailure);
             else if (oversizedRow) reject(oversizedRowError());
             else if (error && !internalCancel) reject(error);
             else resolve({ columns, rows, cellRefs, limit, offset, hasMore });
@@ -727,14 +831,24 @@ async function mysql(profile, password) {
           try {
             onReady(() => { userCancel = true; if (queryStarted) cancel(); });
             if (userCancel) { finish(new Error('Query cancelled.')); return; }
-            const query = connection.query({
-              sql: `SELECT * FROM ${myIdentifier(schema)}.${myIdentifier(name)} LIMIT ? OFFSET ?`,
-              values: [limit + 1, offset], rowsAsArray: true, timeout: 15000
+            const query = connection.execute({
+              sql: plan.sql,
+              values: plan.params, rowsAsArray: true, timeout: plan.timeoutMs || 15000,
+              ...(plan.exportRow ? { dateStrings: true,
+                // jsonStrings is a connection option in mysql2, so override
+                // only this read's JSON parser to preserve numeric precision.
+                typeCast: (field, next) => field.type === 'JSON' || field.extendedFormat === 'json' ? field.string('utf8') : next()
+              } : {})
             });
             queryStarted = true;
             query.on('fields', fields => { columns = fields.map(field => column(field.name, String(field.columnType))); });
             query.on('result', row => {
               if (internalCancel || userCancel) return;
+              if (plan.exportRow) {
+                try { plan.exportRow(row); }
+                catch (error) { exportFailure = error; internalCancel = true; cancel(); }
+                return;
+              }
               if (rows.length < limit) {
                 if (appendRow(rows, row, budget, cellRefs, cellBatch)) return;
                 if (rows.length === 0) oversizedRow = true;
@@ -753,50 +867,38 @@ async function mysql(profile, password) {
       return new Promise((resolve, reject) => {
         pool.getConnection((connectionError, connection) => {
           if (connectionError) { reject(queryError(connectionError, sql, password)); return; }
-          const rows = [];
-          const cellRefs = [];
-          const budget = { bytes: 0 };
-          let columns = [];
-          let recordsets = 0;
-          let rowCount = 0;
-          let hasMore = false;
-          let internalCancel = false;
+          const results = new QueryResults(limit, cellBatch);
+          let current;
           let userCancel = false;
           let queryStarted = false;
           let settled = false;
           const cancel = () => {
             promiseCancelPool.query(`KILL QUERY ${Number(connection.threadId)}`).catch(() => connection.destroy());
           };
-          onReady(() => { userCancel = true; if (queryStarted) cancel(); });
-          const finish = (error, result) => {
+          const finish = error => {
             if (settled) return;
             settled = true;
             connection.destroy();
             if (userCancel) reject(new Error('Query cancelled.'));
-            else if (error && !(internalCancel && error.code === 'ER_QUERY_INTERRUPTED')) reject(queryError(error, sql, password));
-            else resolve({ columns, rows, cellRefs, rowCount: result?.affectedRows ?? rowCount, hasMore });
+            else if (error) reject(queryError(error, sql, password));
+            else resolve(results.finish());
           };
-          if (userCancel) { finish(new Error('Query cancelled.')); return; }
-          const query = connection.query({ sql, rowsAsArray: true, timeout: timeoutMs });
-          queryStarted = true;
-          query.on('fields', fields => {
-            if (!Array.isArray(fields) || fields.length === 0) return;
-            recordsets += 1;
-            if (recordsets === 1) columns = fields.map(field => column(field.name, String(field.columnType)));
-            else if (!hasMore) { hasMore = true; internalCancel = true; cancel(); }
-          });
-          query.on('result', row => {
-            if (!Array.isArray(row)) { rowCount = row.affectedRows || rowCount; return; }
-            if (recordsets > 1) {
-              if (!hasMore) { hasMore = true; internalCancel = true; cancel(); }
-              return;
-            }
-            rowCount += 1;
-            if (rows.length < limit && appendRow(rows, row, budget, cellRefs, cellBatch)) return;
-            if (!hasMore) { hasMore = true; internalCancel = true; cancel(); }
-          });
-          query.on('error', error => finish(error));
-          query.on('end', result => finish(null, result));
+          try {
+            onReady(() => { userCancel = true; if (queryStarted) cancel(); });
+            if (userCancel) { finish(new Error('Query cancelled.')); return; }
+            const query = connection.query({ sql, rowsAsArray: true, timeout: timeoutMs });
+            queryStarted = true;
+            query.on('fields', fields => {
+              current = Array.isArray(fields) && fields.length
+                ? results.begin(fields.map(field => column(field.name, String(field.columnType)))) : null;
+            });
+            query.on('result', row => {
+              if (!Array.isArray(row)) { results.affectedRows += row.affectedRows || 0; return; }
+              if (!userCancel) results.row(current, row);
+            });
+            query.on('error', finish);
+            query.on('end', () => finish());
+          } catch (error) { finish(error); }
         });
       });
     }

@@ -5,10 +5,13 @@ import QtQuick.Layouts
 import qs.Commons
 import qs.Commons as Theme
 
-// A bounded, virtualized result grid. Editing intentionally waits for v2.
+// A bounded, virtualized result grid with viewport-anchored scrolling.
 Item {
   id: grid
   property var columns: []
+  // Widths are remembered per tab and result shape for this workbench session.
+  property string layoutKey: ""
+  property var savedColumnWidths: ({})
   property var rows: []
   property var cellRefs: []
   property bool busy: false
@@ -20,6 +23,13 @@ Item {
   property bool paged: false
   property int selectedRow: -1
   property int selectedColumn: -1
+  property var editableColumns: []
+  property var sortableColumns: []
+  property var sort: null
+  signal sortRequested(string column)
+  signal editCell(var cell)
+  signal copyRow(int row)
+  signal copyResults()
   signal nextPage()
   signal previousPage()
   signal viewCell(var cell)
@@ -31,10 +41,62 @@ Item {
   readonly property color line: Qt.rgba(ink.r, ink.g, ink.b, 0.13)
   readonly property color stripe: Qt.rgba(ink.r, ink.g, ink.b, 0.025)
   readonly property color surface: Qt.tint(Theme.Color.popups.background, Qt.rgba(ink.r, ink.g, ink.b, 0.035))
-  readonly property int cellWidth: Math.max(160, Math.min(250, width / Math.max(1, columns.length)))
-  readonly property int tableWidth: Math.max(width, columns.length * cellWidth)
-  readonly property int firstVisibleColumn: Math.max(0, Math.floor(horizontal.contentX / cellWidth) - 1)
-  readonly property int lastVisibleColumn: Math.min(columns.length, Math.ceil((horizontal.contentX + horizontal.width) / cellWidth) + 1)
+  readonly property int cellWidth: Math.max(160, Math.min(250, Math.floor(horizontal.width / Math.max(1, columns.length))))
+  readonly property string columnLayoutKey: JSON.stringify([layoutKey, columns.map(columnName)])
+  readonly property var columnWidths: savedColumnWidths[columnLayoutKey] || []
+  readonly property var columnOffsets: {
+    var offsets = [0]
+    for (var i = 0; i < columns.length; i++) offsets.push(offsets[i] + columnWidth(i))
+    return offsets
+  }
+  readonly property int tableWidth: Math.max(horizontal.width, columnOffsets[columns.length] || 0)
+  readonly property int firstVisibleColumn: Math.max(0, columnAt(horizontal.contentX) - 1)
+  readonly property int lastVisibleColumn: Math.min(columns.length, columnAt(horizontal.contentX + horizontal.width) + 2)
+
+  onLayoutKeyChanged: horizontal.contentX = 0
+  onTableWidthChanged: Qt.callLater(function() { grid.scrollHorizontally(0) })
+
+  function columnWidth(index) { return columnWidths[index] || cellWidth }
+  function columnOffset(index) { return columnOffsets[index] || 0 }
+  function columnAt(x) {
+    var low = 0, high = columns.length
+    while (low < high) {
+      var middle = Math.floor((low + high) / 2)
+      if (columnOffsets[middle + 1] <= x) low = middle + 1
+      else high = middle
+    }
+    return Math.min(columns.length - 1, low)
+  }
+  function resizeColumn(index, width) {
+    if (index < 0 || index >= columns.length) return
+    var widths = columnWidths.slice()
+    widths[index] = Math.round(Math.max(72, Math.min(1600, width)))
+    var saved = Object.assign({}, savedColumnWidths)
+    saved[columnLayoutKey] = widths
+    savedColumnWidths = saved
+  }
+  function fitColumn(index) {
+    if (index < 0 || index >= columns.length) return
+    headerMetrics.text = columnName(columns[index]) + " ↑"
+    var width = headerMetrics.advanceWidth
+    // Bound measurement work even when a query returns many rows or large values.
+    for (var i = 0; i < Math.min(rows.length, 500); i++) {
+      valueMetrics.text = cellText(rows[i][index]).slice(0, 512).split("\n")[0]
+      width = Math.max(width, valueMetrics.advanceWidth)
+    }
+    resizeColumn(index, Math.min(800, Math.ceil(width) + 28))
+  }
+  TextMetrics {
+    id: headerMetrics
+    font.family: Style.font.family
+    font.pixelSize: Math.max(14, Style.font.body)
+    font.bold: true
+  }
+  TextMetrics {
+    id: valueMetrics
+    font.family: Style.font.family
+    font.pixelSize: Math.max(14, Style.font.body)
+  }
 
   onColumnsChanged: {
     horizontal.contentX = 0
@@ -42,6 +104,7 @@ Item {
     selectedColumn = -1
   }
   onRowsChanged: {
+    body.contentY = 0
     selectedRow = -1
     selectedColumn = -1
   }
@@ -52,14 +115,48 @@ Item {
 
   focus: true
   Keys.onPressed: function(event) {
-    if (grid.selectedRow < 0 || grid.selectedColumn < 0) return
+    if (grid.rows.length === 0 || grid.columns.length === 0) return
+    if (grid.selectedRow < 0 || grid.selectedColumn < 0) grid.selectCell(0, 0)
+    var row = grid.selectedRow
+    var column = grid.selectedColumn
     if ((event.modifiers & Qt.ControlModifier) && event.key === Qt.Key_C) {
-      grid.copyCell(grid.selectedCell())
-      event.accepted = true
+      if (event.modifiers & Qt.ShiftModifier) grid.copyRow(row)
+      else grid.copyCell(grid.selectedCell())
+    } else if (event.key === Qt.Key_F2 && grid.canEditSelectedRow()) {
+      grid.editCell(grid.selectedCell())
     } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
       grid.viewCell(grid.selectedCell())
-      event.accepted = true
-    }
+    } else if (event.key === Qt.Key_Left) column--
+    else if (event.key === Qt.Key_Right) column++
+    else if (event.key === Qt.Key_Up) row--
+    else if (event.key === Qt.Key_Down) row++
+    else if (event.key === Qt.Key_PageDown) row += Math.max(1, Math.floor(body.height / 39))
+    else if (event.key === Qt.Key_PageUp) row -= Math.max(1, Math.floor(body.height / 39))
+    else if (event.key === Qt.Key_Home) { column = 0; if (event.modifiers & Qt.ControlModifier) row = 0 }
+    else if (event.key === Qt.Key_End) { column = grid.columns.length - 1; if (event.modifiers & Qt.ControlModifier) row = grid.rows.length - 1 }
+    else if (event.key === Qt.Key_Tab || event.key === Qt.Key_Backtab) {
+      column += (event.modifiers & Qt.ShiftModifier) || event.key === Qt.Key_Backtab ? -1 : 1
+      if (column >= grid.columns.length) { column = 0; row++ }
+      if (column < 0) { column = grid.columns.length - 1; row-- }
+    } else return
+    grid.selectCell(Math.max(0, Math.min(grid.rows.length - 1, row)), Math.max(0, Math.min(grid.columns.length - 1, column)))
+    grid.ensureSelectedVisible()
+    event.accepted = true
+  }
+
+  function ensureSelectedVisible() {
+    if (selectedRow * 39 < body.contentY) body.contentY = selectedRow * 39
+    else if ((selectedRow + 1) * 39 > body.contentY + body.height) body.contentY = Math.min(Math.max(0, body.contentHeight - body.height), (selectedRow + 1) * 39 - body.height)
+    var left = columnOffset(selectedColumn)
+    var right = columnOffset(selectedColumn + 1)
+    if (left < horizontal.contentX || right - left > horizontal.width) horizontal.contentX = left
+    else if (right > horizontal.contentX + horizontal.width) scrollHorizontally(right - horizontal.width - horizontal.contentX)
+  }
+  function canEditSelectedRow() {
+    return !busy && selectedRow >= 0 && selectedRow < rows.length && editableColumns.length > 0
+  }
+  function canEditSelectedCell() {
+    return !busy && selectedRow >= 0 && selectedColumn >= 0 && editableColumns.indexOf(columnName(columns[selectedColumn])) >= 0
   }
 
   function selectCell(row, column) {
@@ -153,6 +250,23 @@ Item {
     id: cellMenu
     background: Rectangle { color: grid.surface; border.width: 1; border.color: grid.line; radius: 5 }
     CellAction {
+      text: "Edit row… (F2)"
+      visible: grid.editableColumns.length > 0
+      height: visible ? implicitHeight : 0
+      enabled: grid.canEditSelectedRow()
+      onTriggered: grid.editCell(grid.selectedCell())
+    }
+    CellAction {
+      text: "Copy row (Ctrl+Shift+C)"
+      enabled: grid.selectedRow >= 0 && !grid.busy
+      onTriggered: grid.copyRow(grid.selectedRow)
+    }
+    CellAction {
+      text: "Copy results with headers"
+      enabled: grid.rows.length > 0 && !grid.busy
+      onTriggered: grid.copyResults()
+    }
+    CellAction {
       text: "View value"
       enabled: grid.selectedRow >= 0
       onTriggered: grid.viewCell(grid.selectedCell())
@@ -185,8 +299,9 @@ Item {
 
       Flickable {
         id: horizontal
+        objectName: "gridHorizontalViewport"
         anchors.left: parent.left
-        anchors.right: parent.right
+        anchors.right: verticalScroll.left
         anchors.top: parent.top
         anchors.bottom: horizontalControls.visible ? horizontalControls.top : parent.bottom
         visible: grid.columns.length > 0 && !grid.error
@@ -204,24 +319,43 @@ Item {
           Row {
             width: parent.width
             height: 42
-            Item { width: grid.firstVisibleColumn * grid.cellWidth; height: 42 }
+            Item { width: grid.columnOffset(grid.firstVisibleColumn); height: 42 }
             Repeater {
               model: grid.visibleColumnIndexes()
               delegate: Rectangle {
                 id: headerCell
                 required property int modelData
-                width: grid.cellWidth
+                objectName: "gridHeader_" + modelData
+                width: grid.columnWidth(modelData)
                 height: 42
                 clip: true
                 color: Qt.rgba(grid.ink.r, grid.ink.g, grid.ink.b, 0.045)
                 border.width: 1
                 border.color: grid.line
+                readonly property string columnName: grid.columnName(grid.columns[headerCell.modelData])
+                readonly property bool sortable: !grid.busy && grid.sortableColumns.indexOf(columnName) >= 0
+                Accessible.role: sortable ? Accessible.Button : Accessible.StaticText
+                Accessible.name: columnName + (sortable ? ": sort column" : "")
+                activeFocusOnTab: sortable
+                Keys.onReturnPressed: if (sortable) grid.sortRequested(columnName)
+                Keys.onSpacePressed: if (sortable) grid.sortRequested(columnName)
+                ToolTip.visible: headerMouse.containsMouse && sortable
+                ToolTip.delay: 500
+                ToolTip.text: "Sort " + columnName + (grid.sort && grid.sort.column === columnName ? grid.sort.direction === "asc" ? " descending" : ": restore default order" : " ascending")
+                MouseArea {
+                  id: headerMouse
+                  anchors.fill: parent
+                  hoverEnabled: true
+                  enabled: headerCell.sortable
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: grid.sortRequested(headerCell.columnName)
+                }
                 Text {
                   anchors.fill: parent
                   anchors.leftMargin: 14
                   anchors.rightMargin: 10
                   verticalAlignment: Text.AlignVCenter
-                  text: grid.columnName(grid.columns[headerCell.modelData])
+                  text: grid.columnName(grid.columns[headerCell.modelData]) + (grid.sort && grid.sort.column === grid.columnName(grid.columns[headerCell.modelData]) ? (grid.sort.direction === "asc" ? " ↑" : " ↓") : "")
                   textFormat: Text.PlainText
                   color: grid.ink
                   font.family: Style.font.family
@@ -235,12 +369,12 @@ Item {
 
           ListView {
             id: body
+            objectName: "gridRowsViewport"
             width: parent.width
             height: parent.height - 42
             clip: true
             boundsBehavior: Flickable.StopAtBounds
             model: grid.rows
-            ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
             WheelHandler {
               target: null
               acceptedDevices: PointerDevice.Mouse | PointerDevice.TouchPad
@@ -253,13 +387,14 @@ Item {
               property var values: modelData
               width: grid.tableWidth
               height: 39
-              Item { width: grid.firstVisibleColumn * grid.cellWidth; height: 39 }
+              Item { width: grid.columnOffset(grid.firstVisibleColumn); height: 39 }
               Repeater {
                 model: grid.visibleColumnIndexes()
                 delegate: Rectangle {
                   id: bodyCell
                   required property int modelData
-                  width: grid.cellWidth
+                  objectName: "gridCell_" + rowDelegate.index + "_" + modelData
+                  width: grid.columnWidth(modelData)
                   height: 39
                   clip: true
                   color: grid.selectedRow === rowDelegate.index && grid.selectedColumn === bodyCell.modelData
@@ -296,7 +431,8 @@ Item {
                     onDoubleClicked: function(mouse) {
                       if (mouse.button !== Qt.LeftButton) return
                       grid.selectCell(rowDelegate.index, bodyCell.modelData)
-                      grid.viewCell(grid.selectedCell())
+                      if (grid.canEditSelectedCell()) grid.editCell(grid.selectedCell())
+                      else grid.viewCell(grid.selectedCell())
                     }
                     onWheel: function(wheel) { wheel.accepted = false }
                   }
@@ -305,6 +441,82 @@ Item {
             }
           }
         }
+      }
+
+      // This viewport-owned hit area keeps the pointer grab while virtualized
+      // header delegates are rebuilt during a resize. Other header clicks pass through.
+      MouseArea {
+        id: columnResize
+        objectName: "gridColumnResize"
+        anchors.left: horizontal.left
+        anchors.top: horizontal.top
+        width: horizontal.width
+        height: 42
+        z: 1
+        visible: horizontal.visible
+        hoverEnabled: true
+        preventStealing: true
+        property int resizingColumn: -1
+        property real pressX: 0
+        property real pressWidth: 0
+        property int hoveredColumn: boundaryAt(mouseX)
+        function boundaryAt(x) {
+          var contentX = x + horizontal.contentX
+          var index = grid.columnAt(contentX)
+          if (index < 0) return -1
+          if (Math.abs(contentX - grid.columnOffset(index + 1)) <= 5) return index
+          if (index > 0 && Math.abs(contentX - grid.columnOffset(index)) <= 5) return index - 1
+          return -1
+        }
+        cursorShape: resizingColumn >= 0 || hoveredColumn >= 0 ? Qt.SizeHorCursor
+          : grid.sortableColumns.indexOf(grid.columnName(grid.columns[grid.columnAt(mouseX + horizontal.contentX)])) >= 0 && !grid.busy ? Qt.PointingHandCursor : Qt.ArrowCursor
+        onPressed: function(mouse) {
+          resizingColumn = boundaryAt(mouse.x)
+          if (resizingColumn < 0) { mouse.accepted = false; return }
+          horizontal.cancelFlick()
+          pressX = mouse.x
+          pressWidth = grid.columnWidth(resizingColumn)
+        }
+        onPositionChanged: function(mouse) {
+          if (pressed && resizingColumn >= 0) grid.resizeColumn(resizingColumn, pressWidth + mouse.x - pressX)
+        }
+        onReleased: resizingColumn = -1
+        onCanceled: resizingColumn = -1
+        onDoubleClicked: function(mouse) { grid.fitColumn(boundaryAt(mouse.x)) }
+        ToolTip.visible: containsMouse && hoveredColumn >= 0 && !pressed
+        ToolTip.delay: 600
+        ToolTip.text: "Drag to resize · Double-click to fit"
+        Rectangle {
+          visible: columnResize.containsMouse && columnResize.hoveredColumn >= 0 || columnResize.resizingColumn >= 0
+          x: grid.columnOffset((columnResize.resizingColumn >= 0 ? columnResize.resizingColumn : columnResize.hoveredColumn) + 1) - horizontal.contentX - 1
+          width: 2
+          height: parent.height
+          color: Theme.Color.accent
+        }
+      }
+
+      ScrollBar {
+        id: verticalScroll
+        objectName: "gridVerticalScrollBar"
+        anchors.top: parent.top
+        anchors.topMargin: 42
+        anchors.bottom: horizontalControls.visible ? horizontalControls.top : parent.bottom
+        anchors.right: parent.right
+        width: 14
+        orientation: Qt.Vertical
+        policy: ScrollBar.AlwaysOn
+        visible: horizontal.visible && body.contentHeight > body.height
+        minimumSize: Math.min(1, 28 / Math.max(1, height))
+        size: body.visibleArea.heightRatio
+        position: body.visibleArea.yPosition
+        active: hovered || pressed || body.moving
+        onPositionChanged: if (pressed) body.contentY = Math.max(0, Math.min(body.contentHeight - body.height, position * body.contentHeight))
+      }
+
+      WheelHandler {
+        target: null
+        acceptedDevices: PointerDevice.Mouse | PointerDevice.TouchPad
+        onWheel: function(event) { grid.handleGridWheel(event) }
       }
 
       Rectangle {

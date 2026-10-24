@@ -16,9 +16,9 @@ function name(value) {
 
 // One read plan for all adapters: values remain parameters and identifiers must
 // come from fresh metadata. Every existing caller may omit sort and filter.
-export function tableReadPlan(type, schema, table, definition, { limit, offset, sort = null, filter = null } = {}) {
+export function tableReadPlan(type, schema, table, definition, { limit, offset, sort = null, filter = null, selectedColumns = null, unpaged = false } = {}) {
   if (!dialects.has(type)) throw new Error('Invalid database dialect.');
-  if (!Number.isInteger(limit) || limit < 1 || limit > 1000 || !Number.isInteger(offset) || offset < 0 || offset > 10000000) throw new Error('Invalid table page.');
+  if (!unpaged && (!Number.isInteger(limit) || limit < 1 || limit > 1000 || !Number.isInteger(offset) || offset < 0 || offset > 10000000)) throw new Error('Invalid table page.');
   const columns = definition?.columns || [];
   const quote = type === 'mysql' ? value => '`' + name(value).replaceAll('`', '``') + '`'
     : type === 'postgres' || type === 'cloudflare_d1' ? value => '"' + name(value).replaceAll('"', '""') + '"'
@@ -66,12 +66,31 @@ export function tableReadPlan(type, schema, table, definition, { limit, offset, 
   for (const column of columns.filter(column => column.primaryKey)) {
     if (!order.some(item => item.column === column.name)) order.push({ column: column.name, direction: 'asc' });
   }
-  let sql = `SELECT * FROM ${quote(schema)}.${quote(table)}`;
+  let projection = '*';
+  if (selectedColumns !== null) {
+    if (!Array.isArray(selectedColumns) || !selectedColumns.length || new Set(selectedColumns).size !== selectedColumns.length) throw new Error('Invalid export columns. Select at least one column.');
+    projection = selectedColumns.map(columnName => {
+      const column = lookup(columnName);
+      const field = quote(column.name);
+      // Keep decimal and temporal precision before the SQL Server driver turns
+      // these into JavaScript numbers or millisecond Date objects.
+      if (unpaged && ['sqlserver', 'azure_sql'].includes(type)) {
+        if (/^(decimal|numeric|money|smallmoney)$/i.test(column.type)) return `CONVERT(varchar(100), ${field}, 2) AS ${field}`;
+        if (/^(date|datetime|datetime2|smalldatetime|datetimeoffset|time)$/i.test(column.type)) return `CONVERT(varchar(50), ${field}, 127) AS ${field}`;
+      }
+      return field;
+    }).join(', ');
+  }
+  let sql = `SELECT ${projection} FROM ${quote(schema)}.${quote(table)}`;
   if (where) sql += ' WHERE ' + where;
-  if (order.length) sql += ' ORDER BY ' + order.map(item => `${quote(item.column)} ${item.direction.toUpperCase()}`).join(', ');
-  else if (type === 'sqlserver' || type === 'azure_sql') sql += ' ORDER BY (SELECT NULL)';
-  if (type === 'sqlserver' || type === 'azure_sql') sql += ` OFFSET ${bind(offset)} ROWS FETCH NEXT ${bind(limit + 1)} ROWS ONLY`;
-  else if (type === 'mysql') sql += ` LIMIT ${limit + 1} OFFSET ${offset}`;
-  else sql += ` LIMIT ${bind(limit + 1)} OFFSET ${bind(offset)}`;
+  // Export projections may cast values to text for lossless serialization.
+  // Qualify the source column so sorting never uses that text-valued alias.
+  if (order.length) sql += ' ORDER BY ' + order.map(item => `${unpaged ? quote(table) + '.' : ''}${quote(item.column)} ${item.direction.toUpperCase()}`).join(', ');
+  else if (!unpaged && (type === 'sqlserver' || type === 'azure_sql')) sql += ' ORDER BY (SELECT NULL)';
+  if (!unpaged) {
+    if (type === 'sqlserver' || type === 'azure_sql') sql += ` OFFSET ${bind(offset)} ROWS FETCH NEXT ${bind(limit + 1)} ROWS ONLY`;
+    else if (type === 'mysql') sql += ` LIMIT ${limit + 1} OFFSET ${offset}`;
+    else sql += ` LIMIT ${bind(limit + 1)} OFFSET ${bind(offset)}`;
+  }
   return { sql, params, order, stableOrder: columns.some(column => column.primaryKey) };
 }

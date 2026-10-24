@@ -28,7 +28,7 @@ function createServer() {
   register(server, 'list_objects', 'List tables and views in a saved connection.', z.object({ profile, schema }), ({ profile, schema }, signal) => bridge.objects(profile, schema, signal));
   register(server, 'describe_table', 'Get columns, keys and indexes for a table or view.', z.object({ profile, schema, name }), ({ profile, schema, name }, signal) => bridge.describe(profile, schema, name, signal));
   register(server, 'read_rows', 'Read a page of rows from a table or view.', z.object({ profile, schema, name, limit, offset: z.number().int().min(0).max(10000000).optional() }), ({ profile, schema, name, limit, offset }, signal) => bridge.rows(profile, schema, name, limit, offset, signal));
-  register(server, 'run_query', 'Run SQL using a saved DB Studio connection. This can modify data if the database account permits it.', z.object({ profile, sql: z.string().min(1).max(200000), limit, timeoutMs: z.number().int().min(1000).max(120000).optional() }), ({ profile, sql, limit, timeoutMs }, signal) => bridge.query(profile, sql, limit, timeoutMs, signal));
+  register(server, 'run_query', 'Run SQL using a saved DB Studio connection. This can modify data if the database account permits it.', z.object({ profile, sql: z.string().min(1).max(200000), limit, timeoutMs: z.number().int().min(1000).max(1000000).optional() }), ({ profile, sql, limit, timeoutMs }, signal) => bridge.query(profile, sql, limit, timeoutMs, signal));
   return server;
 }
 

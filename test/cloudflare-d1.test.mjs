@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { mkdtemp, readFile, writeFile, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, writeFile, readdir, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { cloudflareD1 } from '../backend/cloudflare-d1.mjs';
@@ -143,13 +143,15 @@ test('D1 limits response bytes and identifies multiple statements without implyi
   let mode = 'multiple';
   const adapter = await cloudflareD1(profile,token,{fetchApi:async (url,options) => {
     if (options.method === 'GET') return response({name:'fixture'});
-    if (mode === 'multiple') return response([...raw([],[],2),...raw(['id'],[[1],[2],[3]])]);
+    if (mode === 'multiple') return response([...raw([],[],2),...raw(['id'],[[1],[2],[3]]),...raw(['name'],[['second']]),...raw(['empty'],[])]);
     return new Response(new ReadableStream({start(controller) { controller.enqueue(new Uint8Array(32*1024*1024+1)); controller.close(); }}));
   }});
   const result = await adapter.run('UPDATE fixture SET x=1; SELECT id FROM fixture',2);
-  assert.match(result.message,/2 SQL statements executed/);
+  assert.match(result.message,/4 SQL statements executed/);
   assert.deepEqual(result.rows,[[1],[2]]);
   assert.equal(result.hasMore,true);
+  assert.deepEqual(result.resultSets.map(set => set.rows), [[[1],[2]],[['second']],[]]);
+  assert.equal(result.affectedRows,2);
   mode = 'large';
   await assert.rejects(adapter.run('SELECT * FROM huge',100),/exceeds 32 MB/);
 });
@@ -169,10 +171,11 @@ test('D1 works through the real worker protocol with a local SQLite-backed API f
       if (options.headers.Authorization !== 'Bearer ${token}') return Response.json({success:false},{status:403});
       if (options.method === 'GET') return Response.json({success:true,result:{name:'fixture-database'}});
       const {sql,params} = JSON.parse(options.body);
+      if (sql.includes('FROM "main"."slow"')) return new Promise((resolve,reject) => options.signal.addEventListener('abort',() => reject(new Error('aborted')),{once:true}));
       try {
         const statement = db.prepare(sql);
         const columns = statement.columns().map(column => column.name);
-        const rows = statement.all(...params).map(row => columns.map(column => row[column]));
+        const rows = statement.all(...params).map(row => columns.map(column => row[column] instanceof Uint8Array ? Array.from(row[column]) : row[column]));
         return Response.json({success:true,result:[{success:true,results:{columns,rows},meta:{changes:db.prepare('SELECT changes() AS n').get().n}}]});
       } catch (error) { return Response.json({success:false,errors:[{message:error.message}]},{status:400}); }
     };
@@ -205,5 +208,53 @@ test('D1 works through the real worker protocol with a local SQLite-backed API f
   assert.equal((await worker.call('query.run',{connectionId,sql:"UPDATE people SET name = 'Changed' WHERE id = 1"})).rowCount,1);
   assert.deepEqual((await worker.call('query.run',{connectionId,sql:'SELECT name FROM people WHERE id = 1'})).rows,[['Changed']]);
   await assert.rejects(worker.call('query.run',{connectionId,sql:'SELECT missing FROM people'}),/no such column/);
+  // Exports use the real worker and paged HTTP adapter, with SQLite executing
+  // generated projections, filters, ordering, and the resulting INSERT script.
+  await worker.call('query.run',{connectionId,sql:'CREATE TABLE exports(id INTEGER PRIMARY KEY, name TEXT, payload BLOB, computed TEXT GENERATED ALWAYS AS (name || id) VIRTUAL)'});
+  await worker.call('query.run',{connectionId,sql:"WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<1505) INSERT INTO exports(id,name,payload) SELECT x, CASE WHEN x=1 THEN NULL WHEN x=2 THEN '' ELSE 'O''Reilly, ' || char(10) || replace(hex(zeroblob(3000)), '0', 'é') END, X'00FF' FROM n"});
+  const csvPath = path.join(directory,'full.csv');
+  const csv = await worker.call('table.export',{connectionId,name:'exports',format:'csv',columns:['id','name'],filePath:csvPath});
+  assert.equal(csv.rowCount,1505);
+  const contents = await readFile(csvPath,'utf8');
+  assert.ok(contents.startsWith('"id","name"\r\n"1",\r\n"2",""\r\n'));
+  assert.ok(contents.includes('é'.repeat(6000)));
+  assert.ok(contents.includes('"1505"'));
+  const sqlPath = path.join(directory,'filtered.sql');
+  const sql = await worker.call('table.export',{connectionId,name:'exports',format:'sql',columns:['id','name','payload'],filePath:sqlPath,filter:{column:'id',operator:'greaterThan',value:1500},sort:{column:'id',direction:'desc'}});
+  assert.equal(sql.rowCount,5);
+  const script = await readFile(sqlPath,'utf8');
+  assert.ok(script.indexOf('VALUES (1505,') < script.indexOf('VALUES (1501,'));
+  assert.ok(script.includes("X'00ff'"));
+  const { DatabaseSync } = await import('node:sqlite');
+  const imported = new DatabaseSync(':memory:');
+  try {
+    imported.exec('CREATE TABLE exports(id INTEGER PRIMARY KEY, name TEXT, payload BLOB)');
+    imported.exec(script);
+    assert.equal(imported.prepare('SELECT COUNT(*) AS n FROM exports').get().n,5);
+    const row = imported.prepare('SELECT name,hex(payload) AS payload FROM exports WHERE id=1501').get();
+    assert.equal(row.name,"O'Reilly, \n" + 'é'.repeat(6000));
+    assert.equal(row.payload,'00FF');
+  } finally { imported.close(); }
+  const emptyPath = path.join(directory,'empty.csv');
+  assert.equal((await worker.call('table.export',{connectionId,name:'exports',format:'csv',columns:['name'],filePath:emptyPath,filter:{column:'id',operator:'lessThan',value:0}})).rowCount,0);
+  assert.equal(await readFile(emptyPath,'utf8'),'"name"\r\n');
+  await assert.rejects(worker.call('table.export',{connectionId,name:'exports',format:'sql',columns:['computed'],filePath:sqlPath,overwrite:true}),/generated columns/);
+  await assert.rejects(worker.call('table.export',{connectionId,name:'exports',format:'csv',columns:['missing'],filePath:csvPath,overwrite:true}),/Invalid table column/);
+  await worker.call('query.run',{connectionId,sql:'CREATE VIEW slow AS SELECT * FROM exports'});
+  const cancelledPath = path.join(directory,'cancelled.csv');
+  await writeFile(cancelledPath,'Keep this file');
+  const requestId = worker.nextId;
+  const exporting = worker.call('table.export',{connectionId,name:'slow',format:'csv',columns:['id','name'],filePath:cancelledPath,overwrite:true});
+  const rejected = assert.rejects(exporting,/cancelled/);
+  // Wait for the private partial file, which proves metadata and file setup
+  // completed, before sending cancellation through the actual worker protocol.
+  for (let i=0;i<100;i++) {
+    if ((await readdir(directory)).some(name => name.startsWith('.cancelled.csv.'))) break;
+    await new Promise(resolve => setTimeout(resolve,5));
+  }
+  assert.equal((await worker.call('query.cancel',{targetId:requestId})).cancelled,true);
+  await rejected;
+  assert.equal(await readFile(cancelledPath,'utf8'),'Keep this file');
+  assert.ok(!(await readdir(directory)).some(name => name.endsWith('.tmp')));
   await worker.call('connection.close',{connectionId});
 });

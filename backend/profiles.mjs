@@ -4,6 +4,7 @@ import { promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { normalizeProfile, normalizeType, parseConnectionString } from './connection-string.mjs';
+import { KeyringError, keyringEnvironment, keyringReadError } from './keyring-environment.mjs';
 
 const ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const CANONICAL_PREFIX = 'omarchy-db-browser:v1:';
@@ -13,15 +14,22 @@ export function defaultProfilesPath() {
   return path.join(base, 'omarchy', 'db-browser', 'connections.json');
 }
 
-function runSecretTool(args, input) {
+async function runSecretTool(args, input) {
+  const env = await keyringEnvironment();
   return new Promise((resolve, reject) => {
-    const child = spawn('secret-tool', args, { stdio: ['pipe', 'pipe', 'pipe'] });
+    const child = spawn('secret-tool', args, { env, stdio: ['pipe', 'pipe', 'pipe'] });
     const stdout = [];
     let size = 0;
     const timer = setTimeout(() => child.kill('SIGKILL'), 15000);
     let settled = false;
-    const fail = () => {
-      if (!settled) { settled = true; clearTimeout(timer); reject(new Error('Secure keyring is unavailable.')); }
+    const fail = error => {
+      if (!settled) {
+        settled = true;
+        clearTimeout(timer);
+        reject(new KeyringError(error.code === 'ENOENT'
+          ? 'Secure keyring requires secret-tool. Install libsecret and try again.'
+          : 'Secure keyring could not start. Open DB Studio in your desktop session and try again.'));
+      }
     };
     child.on('error', fail);
     child.stdout.on('data', chunk => {
@@ -36,7 +44,7 @@ function runSecretTool(args, input) {
       settled = true;
       clearTimeout(timer);
       if (code === 0) resolve(Buffer.concat(stdout).toString('utf8'));
-      else reject(new Error('Secure keyring is unavailable.'));
+      else reject(new KeyringError('Secure keyring could not read or update the saved connection. Check that your desktop keyring is running and unlocked, then try again.'));
     });
     child.stdin.on('error', () => {});
     child.stdin.end(input ?? undefined);
@@ -196,7 +204,7 @@ export class ProfileStore {
         definition = this.sessionDefinitions.get(id);
         if (!definition && existing.hasStoredConnection) {
           try { definition = await this.keyring.lookup(id); }
-          catch { throw new Error('Secure keyring is unavailable. Enter connection details again.'); }
+          catch (error) { throw keyringReadError(error); }
         }
         if (!definition) throw new Error('Enter connection details.');
       }
@@ -321,7 +329,7 @@ export class ProfileStore {
     let definition = this.sessionDefinitions.get(id);
     if (!definition && meta.hasStoredConnection) {
       try { definition = await this.keyring.lookup(id); }
-      catch { throw new Error('Secure keyring is unavailable. Enter connection details again.'); }
+      catch (error) { throw keyringReadError(error); }
     }
     if (!definition) throw new Error('Enter connection details again.');
     return { meta, ...parseDefinition(definition, meta, password) };

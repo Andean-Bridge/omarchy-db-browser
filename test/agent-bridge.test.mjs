@@ -54,8 +54,9 @@ test('bridge blocks disabled profiles and closes an enabled connection after a q
       if (action === 'profiles.list') return { profiles };
       if (action === 'agent.connection.open') return { connectionId: 'open-id' };
       if (action === 'query.run') return {
-        columns: [{ name: 'value' }], rows: [['preview…']],
-        cellRefs: [{ row: 0, column: 0, handle: 'private-handle', byteLength: 10000 }]
+        columns: [{ name: 'value' }], rows: [['preview…']], editHandles: ['private-edit-handle'],
+        cellRefs: [{ row: 0, column: 0, handle: 'private-handle', byteLength: 10000 }],
+        resultSets: [{ columns: [{name:'other'}], rows: [['preview…']], cellRefs: [{row:0,column:0,handle:'second-private-handle',byteLength:9000}] }]
       };
       if (action === 'connection.close') return { closed: true };
       throw new Error(`Unexpected action: ${action}`);
@@ -70,6 +71,9 @@ test('bridge blocks disabled profiles and closes an enabled connection after a q
   assert.deepEqual(data.rows, [['preview…']]);
   assert.deepEqual(data.truncatedCells, [{ row: 0, column: 0, byteLength: 10000 }]);
   assert.equal(JSON.stringify(data).includes('private-handle'), false);
+  assert.equal(JSON.stringify(data).includes('second-private-handle'), false);
+  assert.deepEqual(data.resultSets[0].truncatedCells,[{row:0,column:0,byteLength:9000}]);
+  assert.equal('editHandles' in data, false);
   assert.deepEqual(calls.slice(-3).map(call => call.action), ['agent.connection.open', 'query.run', 'connection.close']);
   assert.equal(calls.at(-2).payload.limit, undefined);
 });

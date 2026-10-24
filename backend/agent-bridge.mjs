@@ -2,8 +2,10 @@ import { WorkerClient } from './worker-client.mjs';
 import { withProfileLock } from './operation-lock.mjs';
 
 function publicResult(result) {
-  if (!Array.isArray(result?.cellRefs)) return result;
-  const { cellRefs, ...rest } = result;
+  if (!result || typeof result !== 'object') return result;
+  const { cellRefs, editHandles, resultSets, ...rest } = result;
+  if (Array.isArray(resultSets)) rest.resultSets = resultSets.map(publicResult);
+  if (!Array.isArray(cellRefs)) return rest;
   return {
     ...rest,
     truncatedCells: cellRefs.map(({ row, column, byteLength }) => ({ row, column, byteLength }))

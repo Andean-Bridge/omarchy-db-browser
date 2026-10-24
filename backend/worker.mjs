@@ -5,13 +5,17 @@ import { writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { ProfileStore } from './profiles.mjs';
 import { CellValueStore } from './cell-values.mjs';
+import { RowEditStore, planRowUpdate } from './row-edit.mjs';
 import { tableReadPlan } from './table-read.mjs';
+import { exportTable } from './table-export.mjs';
+import { generateTableScript } from './table-scripts.mjs';
+import { readSqlFile, saveSqlFile } from './sql-files.mjs';
 import { isLoopbackHost } from './connection-string.mjs';
-import { boundedNumber, databaseName, identifier, openDatabase, openSwitchedDatabase, tableReadError } from './drivers.mjs';
+import { queryError, boundedNumber, databaseName, identifier, openDatabase, openSwitchedDatabase, tableReadError } from './drivers.mjs';
 import { createLineWriter } from './protocol.mjs';
 import { SettingsStore, resultLimit } from './settings.mjs';
 import { aiAvailability, generateAiQuery } from './ai.mjs';
-import { compareCatalogs, compareDefinitions, generateSqlServerScript, objectKey, previewSchemaDiffChange, selectSchemaDiffChanges } from './schema-diff.mjs';
+import { compareCatalogs, compareDefinitions, generateSqlServerScript, objectKey, previewSchemaDiffChange, selectSchemaDiffChanges, schemaDiffOptions, schemaDiffChangeReview } from './schema-diff.mjs';
 
 if (Number(process.versions.node.split('.')[0]) < 20) {
   process.stderr.write('DB Studio requires Node.js 20 or newer.\n');
@@ -23,6 +27,7 @@ const settings = new SettingsStore();
 const connections = new Map();
 const running = new Map();
 const cellValues = new CellValueStore();
+const rowEdits = new RowEditStore();
 const diffComparisons = new Map();
 const writeLine = createLineWriter();
 
@@ -41,7 +46,7 @@ function outputFailure() {
 
 function safeError(error) {
   const message = typeof error?.message === 'string' ? error.message : '';
-  const safe = /^(AI |Cell value |Connection |Invalid |Select |Choose |Generate |Schema diff |Enter |Put |Port |Password |The connection |The database |The SQL Server |The old |Saved connection |Secure keyring |Could not |SQL Server driver |PostgreSQL driver |MySQL driver |Query failed|Query cancelled|Query timed out|Unsupported |Limit |Offset |Timeout |Settings |Connection name|Host |Database |User |The previously saved)/;
+  const safe = /^(AI |Cell value |Connection |Invalid |Select |Choose |Generate |Schema diff |Enter |Put |Port |Password |The connection |The database |The SQL Server |The old |Saved connection |Secure keyring |Could not |SQL Server driver |PostgreSQL driver |MySQL driver |Query failed|Query cancelled|Query timed out|Unsupported |SQL files |Limit |Offset |Timeout |Settings |Connection name|Host |Database |User |Cloudflare |The previously saved)/;
   return safe.test(message) ? message : 'Operation failed. Check the connection and try again.';
 }
 
@@ -102,6 +107,8 @@ async function withDiffConnections(sourceProfileId, targetProfileId, callback) {
 
 async function handle(id, action, payload) {
   switch (action) {
+    case 'sql.open': return readSqlFile(payload.filePath);
+    case 'sql.save': return saveSqlFile(payload.filePath, payload.sql, { expectedRevision: payload.revision, overwrite: payload.overwrite === true });
     case 'settings.get': return settings.get();
     case 'ai.status': return aiAvailability().catch(() => ({ available: false, agent: '' }));
     case 'settings.save': return settings.save(payload);
@@ -128,7 +135,7 @@ async function handle(id, action, payload) {
         ]);
         const selection = compareCatalogs(sourceCatalog, targetCatalog,
           payload.selectedSchemas, payload.selectedObjects);
-        if (!selection.schemas.length) throw new Error('Select at least one schema to compare.');
+        if (!selection.selected.length) throw new Error('Select at least one object to compare.');
         const targetObjects = selection.selected.map(object => selection.targetMap.get(objectKey(object))).filter(Boolean);
         const [sourceById, targetById] = await Promise.all([
           source.adapter.diffDetails(selection.selected), target.adapter.diffDetails(targetObjects)
@@ -143,19 +150,23 @@ async function handle(id, action, payload) {
         return { comparisonId: comparison.id, selectedCount: comparison.selectedCount,
           unchanged: comparison.unchanged, missingSchemas: comparison.missingSchemas,
           targetOnly: comparison.targetOnly,
-          changes: comparison.changes.map(entry => ({ schema: entry.schema, name: entry.name,
-            type: entry.type, status: entry.status, notes: entry.notes, targetExists: !!entry.target,
-            columns: (entry.columns || []).map(({ name, action }) => ({ name, action })) })) };
+          changes: comparison.changes.map(entry => {
+            const review = schemaDiffChangeReview(entry);
+            return { schema: entry.schema, name: entry.name, type: entry.type, status: entry.status,
+              notes: [...entry.notes, ...review.filter(note => !entry.notes.includes(note))],
+              reviewRequired: review.length > 0, targetExists: !!entry.target,
+              columns: (entry.columns || []).map(({ name, action }) => ({ name, action })) };
+          }) };
       });
     case 'schemaDiff.preview': {
       const saved = diffComparisons.get(payload.comparisonId);
       if (!saved) throw new Error('Schema diff expired. Compare again.');
-      return previewSchemaDiffChange(saved.comparison, payload.objectKey, saved);
+      return previewSchemaDiffChange(saved.comparison, payload.objectKey, { ...saved, scriptOptions: schemaDiffOptions(payload.scriptOptions) });
     }
     case 'schemaDiff.script': {
       const saved = diffComparisons.get(payload.comparisonId);
       if (!saved) throw new Error('Schema diff expired. Compare again.');
-      saved.script = generateSqlServerScript(selectSchemaDiffChanges(saved.comparison, payload.selectedKeys), saved);
+      saved.script = generateSqlServerScript(selectSchemaDiffChanges(saved.comparison, payload.selectedKeys), { ...saved, scriptOptions: schemaDiffOptions(payload.scriptOptions) });
       return saved.script;
     }
     case 'schemaDiff.save': {
@@ -186,6 +197,7 @@ async function handle(id, action, payload) {
       cancelConnectionTasks(connection.id);
       connections.delete(connection.id);
       cellValues.clearConnection(connection.id);
+      rowEdits.clearConnection(connection.id);
       await connection.adapter.close();
       return { closed: true };
     }
@@ -213,6 +225,7 @@ async function handle(id, action, payload) {
       connections.delete(previous.id);
       cancelConnectionTasks(previous.id);
       cellValues.clearConnection(previous.id);
+      rowEdits.clearConnection(previous.id);
       await previous.adapter.close().catch(() => {});
       return publicConnection(replacement);
     }
@@ -234,6 +247,13 @@ async function handle(id, action, payload) {
       try { return await connection.adapter.describe(schema, name); }
       catch (error) { throw tableReadError(error, connection.profile.type, 'definition', connection.password); }
     }
+    case 'table.script': {
+      const connection = requireConnection(payload.connectionId);
+      const schema = schemaFor(connection, payload.schema);
+      const name = identifier(payload.name, 'table name');
+      try { return await generateTableScript(connection.adapter, connection.profile.type, schema, name, payload.script); }
+      catch (error) { throw queryError(error, '', connection.password); }
+    }
     case 'table.rows': {
       const connection = requireConnection(payload.connectionId);
       const schema = schemaFor(connection, payload.schema);
@@ -241,29 +261,83 @@ async function handle(id, action, payload) {
       const offset = boundedNumber(payload.offset, 0, 0, 10000000, 'Offset');
       const task = { connectionId: connection.id, cancel: null, cancelRequested: false };
       const cellBatch = cellValues.begin(connection.id);
+      const editBatch = rowEdits.beginPage(connection.id, schema, name);
+      cellBatch.captureRow = connection.adapter.updateCell ? editBatch.captureRow : undefined;
       running.set(id, task);
       try {
         const limit = resultLimit(payload.limit, (await settings.get()).defaultLimit);
-        let plan;
-        if (connection.profile.type === 'cloudflare_d1') {
-          const definition = await connection.adapter.describe(schema, name);
-          if (task.cancelRequested) throw new Error('Query cancelled.');
-          plan = tableReadPlan('cloudflare_d1', schema, name, definition, { limit, offset, sort: payload.sort, filter: payload.filter });
+        let definition;
+        try { definition = await connection.adapter.describe(schema, name); }
+        catch (error) {
+          if (payload.sort != null || payload.filter != null) throw new Error('Could not load the column details needed to sort or filter this table.');
         }
+        if (task.cancelRequested) throw new Error('Query cancelled.');
+        const plan = tableReadPlan(connection.profile.type, schema, name, definition, { limit, offset, sort: payload.sort, filter: payload.filter });
         const result = await connection.adapter.rows(schema, name, limit, offset, cancel => {
           task.cancel = cancel;
           if (task.cancelRequested) cancel();
         }, cellBatch, plan);
         if (task.cancelRequested) throw new Error('Query cancelled.');
         if (connections.get(connection.id) !== connection || !cellBatch.commit()) throw new Error('Connection is closed.');
-        return plan ? { ...result, order: plan.order, stableOrder: plan.stableOrder } : result;
+        if (!editBatch.commitPage(result.columns)) throw new Error('Connection is closed.');
+        return { ...result, editHandles: editBatch.handlesForRows, order: plan.order, stableOrder: plan.stableOrder };
       } catch (error) {
         if (task.cancelRequested) throw new Error('Query cancelled.');
-        if (error?.code === 'ROW_TOO_LARGE' || (connection.profile.type === 'cloudflare_d1' && /^Invalid /.test(error?.message || ''))) throw error;
+        if (error?.code === 'ROW_TOO_LARGE' || /^(Invalid |Could not load the column)/.test(error?.message || '')) throw error;
         throw tableReadError(error, connection.profile.type, 'data', connection.password);
       } finally {
         cellBatch.discard();
+        editBatch.discard();
         running.delete(id);
+      }
+    }
+    case 'table.export': {
+      const connection = requireConnection(payload.connectionId);
+      const schema = schemaFor(connection, payload.schema);
+      const name = identifier(payload.name, 'table name');
+      const task = { connectionId: connection.id, cancel: null, cancelRequested: false };
+      running.set(id, task);
+      try {
+        const definition = await connection.adapter.describe(schema, name);
+        const checkCancelled = () => {
+          if (task.cancelRequested) throw new Error('Query cancelled.');
+          if (connections.get(connection.id) !== connection) throw new Error('Connection is closed.');
+        };
+        checkCancelled();
+        const timeoutMs = boundedNumber(payload.timeoutMs, 30000, 1000, 1000000, 'Timeout');
+        return await exportTable({ adapter: connection.adapter, type: connection.profile.type, schema, name, definition,
+          format: payload.format, columns: payload.columns, filter: payload.filter, sort: payload.sort,
+          filePath: payload.filePath, overwrite: payload.overwrite === true, timeoutMs, checkCancelled,
+          onReady: cancel => { task.cancel = cancel; if (task.cancelRequested) cancel(); } });
+      } catch (error) {
+        if (task.cancelRequested) throw new Error('Query cancelled.');
+        throw error;
+      } finally { running.delete(id); }
+    }
+    case 'table.updateRow':
+    case 'table.updateCell': {
+      const connection = requireConnection(payload.connectionId);
+      if (!connection.adapter.updateCell) throw new Error('Could not edit row: use SQL to change values in this database.');
+      let snapshot;
+      try { snapshot = rowEdits.snapshot(connection.id, payload.handle); }
+      catch (error) { throw new Error('Could not edit row: ' + error.message); }
+      const { schema, name } = snapshot;
+      const capturedColumns = snapshot.columns;
+      const changes = action === 'table.updateCell' ? [{ column: identifier(payload.column, 'column'), value: payload.value }] : payload.changes;
+      // Consume the snapshot before awaiting anything so duplicate saves cannot
+      // race. Failed edits require a refresh rather than a blind retry.
+      rowEdits.remove(payload.handle);
+      try {
+        const objects = await connection.adapter.objects(schema);
+        if (!objects.some(object => object.name === name && object.type === 'table')) throw new Error('Only base tables can be edited.');
+        const definition = await connection.adapter.describe(schema, name);
+        // Column order is supplied by the captured table read, never by the UI.
+        if (!capturedColumns) throw new Error('Refresh the table before editing.');
+        const plan = planRowUpdate(connection.profile.type, schema, name, definition, capturedColumns, snapshot, changes);
+        if (connections.get(connection.id) !== connection) throw new Error('Connection is closed.');
+        return await connection.adapter.updateCell(plan, schema, name);
+      } catch (error) {
+        throw new Error(queryError(error, '', connection.password).message);
       }
     }
     case 'query.run': {
@@ -272,7 +346,7 @@ async function handle(id, action, payload) {
         throw new Error('Enter a SQL query under 200 KB.');
       }
       const limit = resultLimit(payload.limit, (await settings.get()).defaultLimit);
-      const timeoutMs = boundedNumber(payload.timeoutMs, 30000, 1000, 120000, 'Timeout');
+      const timeoutMs = boundedNumber(payload.timeoutMs, 30000, 1000, 1000000, 'Timeout');
       const task = { connectionId: connection.id, cancel: null, cancelRequested: false };
       const cellBatch = cellValues.begin(connection.id);
       running.set(id, task);
@@ -367,6 +441,7 @@ lines.on('line', line => {
 async function shutdown() {
   for (const task of running.values()) task.cancel?.();
   cellValues.dispose();
+  rowEdits.dispose();
   await Promise.allSettled([...connections.values()].map(connection => connection.adapter.close()));
 }
 lines.on('close', () => { void shutdown(); });
