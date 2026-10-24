@@ -476,7 +476,7 @@ Item {
                   HoverHandler { id: connectionHover }
                   ToolTip {
                     id: connectionTip
-                    visible: connectionHover.hovered
+                    visible: connectionHover.hovered && !browserToggle.hovered
                     delay: 600
                     text: root.connectionLabel(connectionTab.modelData)
                     contentItem: Text { text: connectionTip.text; textFormat: Text.PlainText; color: root.ink; font.family: Style.font.family }
@@ -485,10 +485,40 @@ Item {
                   Rectangle { anchors.left: parent.left; anchors.right: parent.right; anchors.bottom: parent.bottom; height: 3; color: root.accent; visible: connectionTab.selectedConnection }
                   RowLayout {
                     anchors.fill: parent
-                    anchors.leftMargin: 14
+                    anchors.leftMargin: 6
                     anchors.rightMargin: 34
-                    spacing: 10
-                    Rectangle { Layout.preferredWidth: 10; Layout.preferredHeight: 10; radius: 5; color: connectionTab.modelData.connectionId ? "#58c89a" : connectionTab.modelData.connecting ? "#e3bb73" : root.softInk }
+                    spacing: 6
+                    ToolButton {
+                      id: browserToggle
+                      objectName: "toggleConnectionBrowser_" + connectionTab.modelData.workspaceId
+                      Layout.preferredWidth: 28
+                      Layout.preferredHeight: 30
+                      hoverEnabled: true
+                      checkable: true
+                      checked: connectionTab.modelData.sidebarVisible
+                      Accessible.name: (checked ? "Hide browser for " : "Show browser for ") + root.connectionLabel(connectionTab.modelData)
+                      ToolTip.visible: hovered
+                      ToolTip.delay: 300
+                      ToolTip.text: (checked ? "Hide browser" : "Show browser") + " (Ctrl+B)"
+                      HoverHandler { cursorShape: Qt.PointingHandCursor }
+                      contentItem: Item {
+                        Rectangle {
+                          anchors.centerIn: parent
+                          width: 10; height: 10; radius: 5
+                          color: connectionTab.modelData.connectionId ? "#58c89a" : connectionTab.modelData.connecting ? "#e3bb73" : root.softInk
+                        }
+                      }
+                      background: Rectangle {
+                        radius: 5
+                        color: browserToggle.hovered ? root.raised : browserToggle.checked ? Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.12) : "transparent"
+                        border.width: browserToggle.activeFocus ? 2 : browserToggle.hovered || browserToggle.checked ? 1 : 0
+                        border.color: browserToggle.activeFocus ? root.accent : root.line
+                      }
+                      onClicked: {
+                        if (root.activateWorkspace(connectionTab.modelData.workspaceId))
+                          connectionTab.modelData.sidebarVisible = !connectionTab.modelData.sidebarVisible
+                      }
+                    }
                     Text { id: connectionName; Layout.fillWidth: true; text: root.connectionLabel(connectionTab.modelData); textFormat: Text.PlainText; color: root.ink; font.family: Style.font.family; font.pixelSize: Math.max(13, Style.font.bodySmall); font.bold: connectionTab.selectedConnection; elide: Text.ElideRight }
                     BusyIndicator { Layout.preferredWidth: 16; Layout.preferredHeight: 16; running: connectionTab.modelData.hasRunningWork(); visible: running }
                   }

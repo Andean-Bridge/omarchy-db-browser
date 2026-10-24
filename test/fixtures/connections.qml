@@ -33,7 +33,28 @@ TestCase {
         suite.mouseClick(suite.visualFind(findChild(first,"connectionListDialog").contentItem,"openConnection_staging"))
         suite.tryCompare(first,"connectionId","staging-1",3000)
         suite.tryCompare(first,"schemaLoading",false,3000)
-        first.sidebarVisible=true
+        // Each status dot is a usable browser toggle even at the minimum window size.
+        const firstBrowser=suite.visualFind(window.contentItem,"toggleConnectionBrowser_"+first.workspaceId)
+        first.sidebarVisible=false
+        suite.wait(30)
+        suite.verify(firstBrowser.visible && firstBrowser.width>=28 && firstBrowser.height>=30)
+        suite.verify(firstBrowser.mapToItem(window.contentItem,0,0).x>=0)
+        suite.mouseClick(firstBrowser)
+        suite.compare(first.sidebarVisible,true)
+        suite.compare(firstBrowser.checked,true)
+        suite.verify(findChild(first,"schemaBrowserArea").visible)
+        suite.mouseClick(firstBrowser)
+        suite.compare(first.sidebarVisible,false)
+        suite.compare(firstBrowser.checked,false)
+        firstBrowser.forceActiveFocus()
+        suite.keyClick(Qt.Key_Space)
+        suite.compare(first.sidebarVisible,true)
+        suite.keyClick(Qt.Key_B,Qt.ControlModifier)
+        suite.compare(first.sidebarVisible,false)
+        suite.compare(firstBrowser.checked,false)
+        suite.mouseClick(findChild(app,"toggleBrowserButton"))
+        suite.compare(first.sidebarVisible,true)
+        suite.compare(firstBrowser.checked,true)
         first.objectTypeFilter="table"
         first.objectSearch="Jobs"
         first.expandedSchemas=({dbo:true})
@@ -55,6 +76,15 @@ TestCase {
         suite.tryCompare(second,"schemaLoading",false,3000)
         second.sidebarVisible=true
         suite.compare(app.workspaces.length,2)
+        suite.wait(30)
+        // Clicking an inactive connection's dot activates and toggles only its browser.
+        suite.mouseClick(suite.visualFind(window.contentItem,"toggleConnectionBrowser_"+first.workspaceId))
+        suite.compare(app.activeWorkspace,first)
+        suite.compare(first.sidebarVisible,false)
+        suite.compare(second.sidebarVisible,true)
+        suite.mouseClick(suite.visualFind(window.contentItem,"toggleConnectionBrowser_"+first.workspaceId))
+        suite.compare(first.sidebarVisible,true)
+        app.activateWorkspace(second.workspaceId)
         suite.compare(second.objectSearch,"")
         suite.compare(second.objectTypeFilter,"all")
         second.openTable({schema:"dbo",name:"Jobs",type:"table"})
