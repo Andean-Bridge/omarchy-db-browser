@@ -8,7 +8,7 @@ Choose a connection, explore its schemas, open a table or view, inspect its defi
 
 ## Explore your databases
 
-- **Find what you need.** Search schemas, tables, and views from the sidebar. Use **Show → Tables only / Views only / All objects** to filter the browser; search and object counts follow the selected type. The selection stays in place through refreshes and database switches during the session. Empty schemas stay out of the way.
+- **Find what you need.** Search schemas, tables, and views from the sidebar. Use the filter icon beside **SCHEMAS** to choose **All**, **Tables**, or **Views**; search and object counts follow the selected type. The selection stays in place through refreshes and database switches during the session. Empty schemas stay out of the way.
 - **Inspect data and structure.** Open a table or view to page through rows, or see its columns, keys, and indexes in **Definition**.
 - **Generate table scripts.** Right-click a table in the schema browser, or choose **Generate script…** in its **Definition** view. Open CREATE, ALTER, INSERT, or UPDATE SQL in a new query tab, ready to edit.
 - **Sort and filter rows.** Click a column header to sort, or use **Filter…** (`Ctrl+F` in a table tab) to search the full table before paging. Primary keys provide stable ordering when the data is unchanged.

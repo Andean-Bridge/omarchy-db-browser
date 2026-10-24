@@ -1725,6 +1725,10 @@ Item {
             ctx.moveTo(7, y); ctx.lineTo(18, y)
           }
           break
+        case "filter":
+          ctx.moveTo(2, 3); ctx.lineTo(18, 3); ctx.lineTo(12, 10)
+          ctx.lineTo(12, 16); ctx.lineTo(8, 18); ctx.lineTo(8, 10); ctx.closePath()
+          break
         case "accessories-text-editor":
           ctx.moveTo(4, 4); ctx.lineTo(16, 4)
           ctx.moveTo(4, 9); ctx.lineTo(16, 9)
@@ -1915,6 +1919,19 @@ Item {
     MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: { tabButton.forceActiveFocus(); tabButton.clicked() } }
   }
 
+  component ObjectTypeAction: MenuItem {
+    id: typeAction
+    required property string objectType
+    implicitHeight: 36
+    checkable: true
+    autoExclusive: true
+    checked: root.objectTypeFilter === objectType
+    contentItem: Text { text: typeAction.text; color: root.ink; font.family: root.uiFont; font.pixelSize: Math.max(13, Style.font.bodySmall); verticalAlignment: Text.AlignVCenter; leftPadding: 30 }
+    indicator: Text { x: 10; anchors.verticalCenter: parent.verticalCenter; text: "✓"; visible: typeAction.checked; color: root.accent; font.pixelSize: 14 }
+    background: Rectangle { color: typeAction.highlighted ? root.raised : "transparent"; radius: 3 }
+    onTriggered: root.objectTypeFilter = objectType
+  }
+
   component TableScriptAction: MenuItem {
     id: scriptAction
     required property string scriptKind
@@ -1939,6 +1956,19 @@ Item {
       if (!visible && !root.closingFromHost && root.shell && typeof root.shell.hide === "function")
         root.shell.hide("andean-bridge.db-browser")
       else if (!visible && !root.closingFromHost) root.close()
+    }
+
+    Menu {
+      id: objectTypeMenu
+      objectName: "objectTypeMenu"
+      parent: window.contentItem
+      width: 160
+      padding: 4
+      onAboutToShow: currentIndex = ["all", "table", "view"].indexOf(root.objectTypeFilter)
+      background: Rectangle { color: root.surface; border.width: 1; border.color: root.line; radius: 5 }
+      ObjectTypeAction { text: "All"; objectType: "all" }
+      ObjectTypeAction { text: "Tables"; objectType: "table" }
+      ObjectTypeAction { text: "Views"; objectType: "view" }
     }
 
     Menu {
@@ -2151,45 +2181,26 @@ Item {
               RowLayout {
                 Layout.fillWidth: true
                 visible: !root.databasePickerExpanded
-                spacing: 8
-                Text { text: "Show"; color: root.softInk; font.family: root.uiFont; font.pixelSize: Math.max(13, Style.font.bodySmall) }
-                ComboBox {
-                  id: objectTypeChoice
-                  objectName: "objectTypeFilterChoice"
-                  Layout.fillWidth: true
-                  implicitHeight: 38
-                  font.family: root.uiFont
-                  font.pixelSize: Math.max(13, Style.font.bodySmall)
-                  model: ["All objects", "Tables only", "Views only"]
-                  currentIndex: ["all", "table", "view"].indexOf(root.objectTypeFilter)
-                  Accessible.name: "Show object types"
-                  onActivated: root.objectTypeFilter = ["all", "table", "view"][currentIndex]
-                  contentItem: Text { text: objectTypeChoice.displayText; color: root.ink; font: objectTypeChoice.font; verticalAlignment: Text.AlignVCenter; leftPadding: 10; rightPadding: 24; elide: Text.ElideRight }
-                  indicator: Text { x: objectTypeChoice.width - width - 9; anchors.verticalCenter: parent.verticalCenter; text: "⌄"; color: root.softInk }
-                  background: Rectangle { color: root.surface; radius: 5; border.width: objectTypeChoice.activeFocus ? 2 : 1; border.color: objectTypeChoice.activeFocus ? root.accent : root.line }
-                  delegate: ItemDelegate {
-                    id: objectTypeOption
-                    required property var modelData
-                    required property int index
-                    width: objectTypeChoice.width
-                    height: 36
-                    contentItem: Text { text: objectTypeOption.modelData; color: root.ink; font: objectTypeChoice.font; verticalAlignment: Text.AlignVCenter; elide: Text.ElideRight }
-                    background: Rectangle { color: objectTypeChoice.highlightedIndex === objectTypeOption.index ? root.selected : root.bg }
-                  }
-                  popup: Popup {
-                    y: objectTypeChoice.height
-                    width: objectTypeChoice.width
-                    padding: 4
-                    implicitHeight: contentItem.implicitHeight + 8
-                    contentItem: ListView { clip: true; implicitHeight: contentHeight; model: objectTypeChoice.popup.visible ? objectTypeChoice.delegateModel : null; currentIndex: objectTypeChoice.highlightedIndex }
-                    background: Rectangle { color: root.bg; radius: 5; border.width: 1; border.color: root.accent }
-                  }
-                }
-              }
-              RowLayout {
-                Layout.fillWidth: true
-                visible: !root.databasePickerExpanded
                 Text { text: "SCHEMAS"; color: root.accent; font.family: root.uiFont; font.pixelSize: Math.max(12, Style.font.caption); font.bold: true; font.letterSpacing: 1.1 }
+                ToolButton {
+                  id: objectTypeFilterButton
+                  objectName: "objectTypeFilterButton"
+                  Layout.preferredWidth: 30
+                  Layout.preferredHeight: 28
+                  text: "Filter object types"
+                  Accessible.name: text
+                  Accessible.description: "Showing " + (root.objectTypeFilter === "all" ? "all objects" : root.objectTypeFilter === "table" ? "tables" : "views")
+                  ToolTip.visible: hovered
+                  ToolTip.text: "Filter objects: " + (root.objectTypeFilter === "all" ? "All" : root.objectTypeFilter === "table" ? "Tables" : "Views")
+                  contentItem: Item { StudioIcon { anchors.centerIn: parent; width: 17; height: 17; iconName: "filter" } }
+                  background: Rectangle {
+                    radius: 5
+                    color: root.objectTypeFilter !== "all" ? root.selected : objectTypeFilterButton.hovered ? root.raised : "transparent"
+                    border.width: objectTypeFilterButton.activeFocus || root.objectTypeFilter !== "all" ? 1 : 0
+                    border.color: root.accent
+                  }
+                  onClicked: objectTypeMenu.popup(objectTypeFilterButton, 0, height)
+                }
                 Item { Layout.fillWidth: true }
                 Text { text: root.schemaLoading ? "Loading…" : String(root.filteredSchemas().length); color: root.faintInk; font.family: root.uiFont; font.pixelSize: Math.max(12, Style.font.caption) }
               }

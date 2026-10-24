@@ -13,13 +13,22 @@ TestCase {
     archive: [{schema:"archive",name:"OldJobs",type:"table"}]
   })
   function names() { return panel.filteredSchemas().map(function(schema) { return schema.name }).join(",") }
-  function selectType(choice, index) {
-    mouseClick(choice, choice.width / 2, choice.height / 2)
+  function selectType(button, index) {
+    mouseClick(button, button.width / 2, button.height / 2)
     wait(20)
-    keyClick(Qt.Key_Home)
-    for (let i = 0; i < index; i++) keyClick(Qt.Key_Down)
-    keyClick(Qt.Key_Return)
+    const menu = findChild(panel,"objectTypeMenu")
+    verify(menu.visible)
+    compare(menu.count,3)
+    compare(menu.itemAt(0).text,"All")
+    compare(menu.itemAt(1).text,"Tables")
+    compare(menu.itemAt(2).text,"Views")
+    compare(menu.itemAt(["all","table","view"].indexOf(panel.objectTypeFilter)).checked,true)
+    const item = menu.itemAt(index)
+    mouseClick(item,item.width / 2,item.height / 2)
     wait(30)
+    verify(!menu.visible)
+    verify(menu.itemAt(index).checked)
+    compare([0,1,2].filter(function(i) { return menu.itemAt(i).checked }).length,1)
   }
   Timer {
     interval: 150; running: true
@@ -36,10 +45,21 @@ TestCase {
         panel.objectsBySchema = suite.catalog
         panel.expandedSchemas = ({dbo:true,reports:true,archive:true})
         suite.wait(40)
-        const choice = findChild(panel,"objectTypeFilterChoice")
+        const choice = findChild(panel,"objectTypeFilterButton")
+        const menu = findChild(panel,"objectTypeMenu")
         const list = findChild(panel,"schemaBrowserArea").children[0]
         suite.verify(choice.visible)
-        suite.compare(choice.currentIndex,0)
+        suite.compare(panel.objectTypeFilter,"all")
+        // Keyboard access and dismissal leave the filter unchanged.
+        choice.forceActiveFocus()
+        suite.keyClick(Qt.Key_Space)
+        suite.wait(20)
+        suite.verify(menu.visible)
+        suite.keyClick(Qt.Key_Escape)
+        suite.wait(20)
+        suite.verify(!menu.visible)
+        suite.verify(window.visible)
+        suite.compare(panel.objectTypeFilter,"all")
         suite.compare(list.count,7)
         suite.compare(suite.names(),"dbo,reports,archive")
         suite.selectType(choice,1)
@@ -94,10 +114,13 @@ TestCase {
         suite.wait(40)
         suite.compare(window.width,980)
         suite.compare(window.height,640)
-        suite.verify(choice.visible && choice.width > 120)
+        suite.verify(choice.visible && choice.width >= 28)
         suite.verify(list.height > 40)
         suite.selectType(choice,1)
         suite.compare(list.count,4)
+        suite.mouseClick(choice,choice.width / 2,choice.height / 2)
+        suite.wait(20)
+        suite.verify(menu.visible)
         suite.grabImage(window.contentItem).save("object-filter.png")
         console.log("OBJECT_FILTER_UI_PASSED")
       } catch (error) { console.error("OBJECT_FILTER_UI_FAILED",error,error.stack) }
