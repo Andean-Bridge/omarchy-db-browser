@@ -2380,7 +2380,7 @@ Item {
 
               Rectangle {
                 Layout.fillWidth: true
-                Layout.preferredHeight: 50
+                Layout.preferredHeight: 42
                 color: root.surface
                 border.width: 1
                 border.color: root.line
@@ -2414,7 +2414,7 @@ Item {
                       onXChanged: if (root.activeTabId === modelData.id) Qt.callLater(root.ensureActiveTabVisible)
                       onWidthChanged: if (root.activeTabId === modelData.id) Qt.callLater(root.ensureActiveTabVisible)
                       Layout.preferredWidth: Math.min(210, Math.max(130, tabLabel.implicitWidth + 66))
-                      Layout.preferredHeight: 48
+                      Layout.preferredHeight: 34
                       color: root.activeTabId === workTab.modelData.id ? root.raised : "transparent"
                       border.width: 1
                       border.color: root.line
