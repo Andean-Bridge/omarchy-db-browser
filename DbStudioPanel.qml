@@ -43,6 +43,7 @@ Item {
   property var objectsBySchema: Object.create(null)
   property var expandedSchemas: Object.create(null)
   property string objectSearch: ""
+  property string objectTypeFilter: "all"
   property var selectedObject: null
   property var inspectorDefinition: null
   property int inspectorLoadGeneration: 0
@@ -707,14 +708,15 @@ Item {
   function filteredObjects(schemaName) {
     var list = objectsBySchema[schemaName] || []
     var needle = objectSearch.toLowerCase().trim()
-    if (schemaName.toLowerCase().includes(needle)) return list
-    return needle ? list.filter(function(object) { return object.name.toLowerCase().includes(needle) || object.type.toLowerCase().includes(needle) }) : list
+    var schemaMatches = schemaName.toLowerCase().includes(needle)
+    return list.filter(function(object) {
+      return (objectTypeFilter === "all" || object.type === objectTypeFilter)
+        && (schemaMatches || object.name.toLowerCase().includes(needle) || object.type.toLowerCase().includes(needle))
+    })
   }
   function filteredSchemas() {
-    var needle = objectSearch.toLowerCase().trim()
     return schemas.filter(function(schema) {
-      if ((objectsBySchema[schema.name] || []).length === 0) return false
-      return !needle || schema.name.toLowerCase().includes(needle) || filteredObjects(schema.name).length > 0
+      return filteredObjects(schema.name).length > 0
     })
   }
   function visibleSchemaEntries() {
@@ -722,7 +724,7 @@ Item {
     var visible = filteredSchemas()
     for (var i = 0; i < visible.length; i++) {
       var name = visible[i].name
-      entries.push({ kind: "schema", name: name, count: (objectsBySchema[name] || []).length })
+      entries.push({ kind: "schema", name: name, count: filteredObjects(name).length })
       if (schemaExpanded(name)) {
         var children = filteredObjects(name)
         for (var j = 0; j < children.length; j++) entries.push({ kind: "object", object: children[j] })
@@ -1573,6 +1575,44 @@ Item {
               RowLayout {
                 Layout.fillWidth: true
                 visible: !root.databasePickerExpanded
+                spacing: 8
+                Text { text: "Show"; color: root.softInk; font.family: root.uiFont; font.pixelSize: Math.max(13, Style.font.bodySmall) }
+                ComboBox {
+                  id: objectTypeChoice
+                  objectName: "objectTypeFilterChoice"
+                  Layout.fillWidth: true
+                  implicitHeight: 38
+                  font.family: root.uiFont
+                  font.pixelSize: Math.max(13, Style.font.bodySmall)
+                  model: ["All objects", "Tables only", "Views only"]
+                  currentIndex: ["all", "table", "view"].indexOf(root.objectTypeFilter)
+                  Accessible.name: "Show object types"
+                  onActivated: root.objectTypeFilter = ["all", "table", "view"][currentIndex]
+                  contentItem: Text { text: objectTypeChoice.displayText; color: root.ink; font: objectTypeChoice.font; verticalAlignment: Text.AlignVCenter; leftPadding: 10; rightPadding: 24; elide: Text.ElideRight }
+                  indicator: Text { x: objectTypeChoice.width - width - 9; anchors.verticalCenter: parent.verticalCenter; text: "⌄"; color: root.softInk }
+                  background: Rectangle { color: root.surface; radius: 5; border.width: objectTypeChoice.activeFocus ? 2 : 1; border.color: objectTypeChoice.activeFocus ? root.accent : root.line }
+                  delegate: ItemDelegate {
+                    id: objectTypeOption
+                    required property var modelData
+                    required property int index
+                    width: objectTypeChoice.width
+                    height: 36
+                    contentItem: Text { text: objectTypeOption.modelData; color: root.ink; font: objectTypeChoice.font; verticalAlignment: Text.AlignVCenter; elide: Text.ElideRight }
+                    background: Rectangle { color: objectTypeChoice.highlightedIndex === objectTypeOption.index ? root.selected : root.bg }
+                  }
+                  popup: Popup {
+                    y: objectTypeChoice.height
+                    width: objectTypeChoice.width
+                    padding: 4
+                    implicitHeight: contentItem.implicitHeight + 8
+                    contentItem: ListView { clip: true; implicitHeight: contentHeight; model: objectTypeChoice.popup.visible ? objectTypeChoice.delegateModel : null; currentIndex: objectTypeChoice.highlightedIndex }
+                    background: Rectangle { color: root.bg; radius: 5; border.width: 1; border.color: root.accent }
+                  }
+                }
+              }
+              RowLayout {
+                Layout.fillWidth: true
+                visible: !root.databasePickerExpanded
                 Text { text: "SCHEMAS"; color: root.accent; font.family: root.uiFont; font.pixelSize: Math.max(12, Style.font.caption); font.bold: true; font.letterSpacing: 1.1 }
                 Item { Layout.fillWidth: true }
                 Text { text: root.schemaLoading ? "Loading…" : String(root.filteredSchemas().length); color: root.faintInk; font.family: root.uiFont; font.pixelSize: Math.max(12, Style.font.caption) }
@@ -1602,6 +1642,7 @@ Item {
               }
               Item {
                 id: schemaScroll
+                objectName: "schemaBrowserArea"
                 Layout.fillWidth: true
                 Layout.fillHeight: true
                 visible: !root.databasePickerExpanded
@@ -1642,7 +1683,8 @@ Item {
                   anchors.left: parent.left
                   anchors.right: parent.right
                   visible: !root.connectionId || (!root.schemaLoading && !root.schemaError && root.filteredSchemas().length === 0)
-                  text: !root.connectionId ? "Connect to browse schemas and tables." : root.objectSearch ? "No matching objects." : "No tables or views found."
+                  objectName: "schemaEmptyMessage"
+                  text: !root.connectionId ? "Connect to browse schemas and tables." : root.objectSearch.trim() ? "No matching objects." : root.objectTypeFilter === "table" ? "No tables found." : root.objectTypeFilter === "view" ? "No views found." : "No tables or views found."
                   color: root.softInk
                   wrapMode: Text.WordWrap
                   font.family: root.uiFont

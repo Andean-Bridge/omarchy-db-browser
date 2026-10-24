@@ -8,7 +8,7 @@ Choose a connection, explore its schemas, open a table or view, inspect its defi
 
 ## Explore your databases
 
-- **Find what you need.** Search schemas, tables, and views from the sidebar. Empty schemas stay out of the way.
+- **Find what you need.** Search schemas, tables, and views from the sidebar. Use **Show → Tables only / Views only / All objects** to filter the browser; search and object counts follow the selected type. The selection stays in place through refreshes and database switches during the session. Empty schemas stay out of the way.
 - **Inspect data and structure.** Open a table or view to page through rows, or see its columns, keys, and indexes in **Definition**.
 - **Sort and filter rows.** Click a column header to sort, or use **Filter…** (`Ctrl+F` in a table tab) to search the full table before paging. Primary keys provide stable ordering when the data is unchanged.
 - **Edit table rows.** On SQL Server, Azure SQL, PostgreSQL, and MySQL, use **F2**, **Edit row**, or a double-click to change ordinary text, numeric, and boolean fields in a primary-key table. Review the modified fields and choose **Save row** to save them together, with conflict detection. Keys, generated columns, complex types, views, and SQL query results remain read-only; use SQL for D1 changes.
